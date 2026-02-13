@@ -46,7 +46,7 @@ class LightingEnv:
         torch.manual_seed(seed)
     # ---------- 目标分布生成方式0：虚拟光源混合 ----------
     def _gen_target_mixed_lights(self):
-        num_src = np.random.randint(1, 6)
+        num_src = np.random.randint(1, 3)
         src_pos = np.random.uniform(0, 1, size=(num_src, 2))
         src_hues = np.random.uniform(0, 1.0, size=num_src)
         src_vals = np.random.uniform(0, 1.0, size=num_src)
@@ -63,7 +63,7 @@ class LightingEnv:
         return result['hue_histogram'], result['mean_value'], result['max_value']
     # ---------- 目标分布生成方式1：随机稀疏分布 ----------
     def _gen_target_random_sparse(self):
-        n_peaks = np.random.randint(1, 6)
+        n_peaks = np.random.randint(1, 3)
         hue_hist = np.ones(360) * 0.001
         for _ in range(n_peaks):
             peak_pos = np.random.randint(0, 360)
@@ -104,8 +104,11 @@ class LightingEnv:
             eps=self.eps
         )
         return result['hue_histogram'], result['mean_value'], result['max_value']
-    def reset(self):
-        self.N = np.random.randint(self.min_lights, self.max_lights + 1)
+    def reset(self, N=None):
+        if N is None:
+            self.N = np.random.randint(self.min_lights, self.max_lights + 1)
+        else:
+            self.N = N
         self.positions_raw = np.random.uniform(0, 1, size=(self.N, 2)).astype(np.float32)
         self.positions_padded = np.zeros((self.max_lights, 2), dtype=np.float32)
         self.positions_padded[:self.N] = self.positions_raw
@@ -167,18 +170,20 @@ class LightingEnv:
         value_err_before = abs(step_info['mean_value_before'] - step_info['target_mean_value'])
         value_err_after = abs(step_info['mean_value_after'] - step_info['target_mean_value'])
         reward = 0.0
-        hue_improve = hue_dist_before - hue_dist_after
+        hue_improve = - hue_dist_before + hue_dist_after
         reward += self.args.hue_improve_coef * hue_improve
-        value_improve = value_err_before - value_err_after
+        value_improve = - value_err_before + value_err_after
         reward += self.args.value_improve_coef * value_improve
         if step_info['is_terminal']:
             # 终端：惩罚最终误差
             reward -= self.args.terminal_hue_coef * hue_dist_after
             reward -= self.args.terminal_value_coef * value_err_after
             # 成功奖励（同时满足阈值）
-            if (hue_dist_after < self.args.success_hue_thresh and
-                    value_err_after < self.args.success_value_thresh):
+            if hue_dist_after < self.args.success_hue_thresh:
                 reward += self.args.success_bonus
+            if value_err_after < self.args.success_value_thresh:
+                reward += self.args.success_bonus
+
         return reward
     def step(self, action):
         # print(action)
@@ -342,7 +347,13 @@ def train(args):
                 action = torch.zeros_like(action)
             action = action.cpu().numpy().flatten()
             noise = np.random.normal(0, args.exploration_noise, size=action.shape)
-            action = np.clip(action + noise, 0.0, 1.0)
+            action[0] = action[0] + noise[0]
+            if action[0] > 1:
+                action[0] -= 1
+            if action[0] < 0:
+                action[0] += 1
+            action[0] = np.clip(action[0], 0.0, 1.0)
+            action[1] = np.clip(action[1] + noise[1], 0.0, 1.0)
         next_state, reward, done, info = env.step(action)
         replay_buffer.push(state, action, reward, next_state, done)
         state = next_state if not done else env.reset()
@@ -374,7 +385,11 @@ def train(args):
                         target_actions = target(batch_next_state)
                         if torch.isnan(target_actions).any():
                             target_actions = torch.zeros_like(target_actions)
-                        target_actions = torch.clamp(target_actions + noise, 0.0, 1.0)
+                        target_actions[...,0] = target_actions[...,0] + noise[...,0]
+                        target_actions[target_actions>1] -= 1
+                        target_actions[target_actions<0] += 1
+                        target_actions[...,0] = torch.clamp(target_actions[...,0], 0.0, 1.0)
+                        target_actions[...,1] = torch.clamp(target_actions[...,1] + noise[...,1], 0.0, 1.0)
                         target_q1, target_q2 = target(batch_next_state, target_actions)
                         target_q = torch.min(target_q1, target_q2)
                         target_q = torch.where(
@@ -445,7 +460,7 @@ def train(args):
                 avg_reward = np.mean(episode_rewards[-min(args.print_freq, len(episode_rewards)):])
                 print(f"Episode {len(episode_rewards)} | Steps {total_steps} | "
                       f"AvgReward {avg_reward:.2f} | FinalHueErr {episode_final_hue_err:.4f} | "
-                      f"AvgQ1 {episode_q1_last:.2f}")
+                      f"FinalValueErr {episode_final_value_err:.2f}")
 
             # evaluation
             if len(episode_rewards) % eval_interval == 0 and len(episode_rewards) > 0:
@@ -455,7 +470,7 @@ def train(args):
                 eval_value_errs = []
 
                 for _ in range(num_eval_episodes):
-                    state = env.reset()
+                    state = env.reset(N=10)
                     ep_reward = 0.0
                     done = False
                     while not done:
@@ -498,7 +513,6 @@ def train(args):
 
                 state = env.reset()
 
-    print("Training finished.")
 # ------------------------------ 参数解析 ------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='TD3 for Lighting Control - Wasserstein Reward')
@@ -514,9 +528,9 @@ if __name__ == "__main__":
                         help='Gamma correction for value')
     parser.add_argument('--eps', type=float, default=1e-8,
                         help='Numerical stability epsilon')
-    parser.add_argument('--min_lights', type=int, default=5,
+    parser.add_argument('--min_lights', type=int, default=4,
                         help='Minimum number of lights per episode')
-    parser.add_argument('--max_lights', type=int, default=15,
+    parser.add_argument('--max_lights', type=int, default=16,
                         help='Maximum number of lights per episode (padding size)')
     parser.add_argument('--target_gen_modes', type=int, nargs='+', default=[0, 1],
                         help='Available target generation modes (0: mixed lights, 1: random sparse)')
@@ -528,7 +542,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=3,
                         help='Number of transformer layers')
     # ---------- 训练超参数 ----------
-    parser.add_argument('--total_timesteps', type=int, default=100000,
+    parser.add_argument('--total_timesteps', type=int, default=200000,
                         help='Total environment steps')
     parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size')
@@ -544,11 +558,11 @@ if __name__ == "__main__":
                         help='Critic learning rate')
     parser.add_argument('--policy_delay', type=int, default=2,
                         help='Delay steps for policy update')
-    parser.add_argument('--exploration_noise', type=float, default=0.2,
+    parser.add_argument('--exploration_noise', type=float, default=0.1,
                         help='Exploration noise std')
-    parser.add_argument('--target_noise', type=float, default=0.2,
+    parser.add_argument('--target_noise', type=float, default=0.1,
                         help='Target policy smoothing noise std')
-    parser.add_argument('--noise_clip', type=float, default=0.5,
+    parser.add_argument('--noise_clip', type=float, default=0.1,
                         help='Noise clip limit')
     parser.add_argument('--updates_per_step', type=int, default=1,
                         help='Number of updates per environment step')
@@ -578,9 +592,9 @@ if __name__ == "__main__":
                         help='Coefficient for terminal hue distance penalty')
     parser.add_argument('--terminal_value_coef', type=float, default=3.0,
                         help='Coefficient for terminal value error penalty')
-    parser.add_argument('--success_hue_thresh', type=float, default=0.08,
+    parser.add_argument('--success_hue_thresh', type=float, default=0.2,
                         help='Hue error threshold for success bonus')
-    parser.add_argument('--success_value_thresh', type=float, default=0.02,
+    parser.add_argument('--success_value_thresh', type=float, default=0.1,
                         help='Value error threshold for success bonus')
     parser.add_argument('--success_bonus', type=float, default=10.0,
                         help='Extra reward when terminal errors below thresholds')
