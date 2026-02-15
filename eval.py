@@ -207,15 +207,14 @@ def parse_test_args():
     parser.add_argument('--no_cuda', action='store_true')
 
     # 奖励参数
-    parser.add_argument('--hue_improve_coef', type=float, default=4.0)
-    parser.add_argument('--value_improve_coef', type=float, default=1.0)
-    parser.add_argument('--terminal_hue_coef', type=float, default=5.0)
-    parser.add_argument('--terminal_value_coef', type=float, default=1.5)
-    parser.add_argument('--success_hue_thresh', type=float, default=0.2)
-    parser.add_argument('--success_value_thresh', type=float, default=0.2)
-    parser.add_argument('--success_bonus', type=float, default=10.0)
-    parser.add_argument('--hue_match_coef', type=float, default=8.0)
-    parser.add_argument('--value_match_coef', type=float, default=3.0)
+    parser.add_argument('--step_dist_coef', type=float, default=2.0, help='每步距离负奖励系数')
+    parser.add_argument('--hue_improve_coef', type=float, default=5.0, help='hue改善奖励系数')
+    parser.add_argument('--value_improve_coef', type=float, default=5.0, help='value改善奖励系数')
+    parser.add_argument('--terminal_hue_coef', type=float, default=10.0, help='终端hue得分系数')
+    parser.add_argument('--terminal_value_coef', type=float, default=10.0, help='终端value得分系数')
+    parser.add_argument('--success_hue_thresh', type=float, default=0.15, help='成功hue距离阈值')
+    parser.add_argument('--success_value_thresh', type=float, default=0.15, help='成功value距离阈值')
+    parser.add_argument('--success_bonus', type=float, default=20.0, help='成功额外奖励')
 
     return parser.parse_args()
 
