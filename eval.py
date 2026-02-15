@@ -1,280 +1,339 @@
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import hsv_to_rgb
 import argparse
-import os
-import random
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from pathlib import Path
+from matplotlib.colors import hsv_to_rgb
 
-from models import SeqLight
-from light_mix import compute_mixed_lighting
+# 从你的训练文件导入
+from train import LightingEnv, SeqLight, compute_mixed_lighting
 
-# ===================== 参数解析 =====================
-parser = argparse.ArgumentParser(description='Evaluate SeqLight model with visualization (mimic training env)')
-parser.add_argument('--model_path', type=str, default='./models/best_model.pth')
-parser.add_argument('--grid_size', type=int, nargs=2, default=[120, 160])
-parser.add_argument('--decay_model', type=str, default='gaussian', choices=['gaussian', 'inverse_square'])
-parser.add_argument('--sigma', type=float, default=0.18)
-parser.add_argument('--min_lights', type=int, default=5)
-parser.add_argument('--max_lights', type=int, default=15)
-parser.add_argument('--d_model', type=int, default=64)
-parser.add_argument('--nhead', type=int, default=4)
-parser.add_argument('--num_layers', type=int, default=3)
-parser.add_argument('--seed', type=int, default=123)
-args = parser.parse_args()
-
-# np.random.seed(args.seed)
-# random.seed(args.seed)
-# torch.manual_seed(args.seed)
-# torch.cuda.manual_seed_all(args.seed)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+torch.serialization.add_safe_globals([argparse.Namespace])
 
 
-# ===================== 加载模型 =====================
-def load_model(model_path):
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model not found: {model_path}")
+# ====================== 你提供的专业可视化函数 ======================
+def visualize_individual_and_mixed_lights(
+        positions: np.ndarray,
+        hues: np.ndarray,  # 0~360
+        values: np.ndarray,  # 0~1
+        grid_size=(120, 160),
+        decay_model="gaussian",
+        sigma=0.20,
+        ncols=4,
+        show_mixed_hue=True,
+        figsize=(16, 10),
+        title_prefix=""
+):
+    """
+    真实灯光可视化（单个灯 + 混合亮度 + 混合色相）
+    """
+    N = len(hues)
+    if N == 0:
+        print("No lights provided.")
+        return
 
-    torch.serialization.add_safe_globals([argparse.Namespace])
+    values_norm = np.clip(np.asarray(values, dtype=float), 0, 1)
 
-    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
-
-    model = SeqLight(
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_layers=args.num_layers,
-    ).to(device)
-    model.load_state_dict(checkpoint['policy_state_dict'])
-    model.eval()
-    print(f"Loaded model from {model_path} (episode {checkpoint.get('episode', 'unknown')})")
-    return model
-
-
-# ===================== 模拟环境状态生成（完全复制训练中的 reset/step 逻辑） =====================
-class TestEnv:
-    def __init__(self, args):
-        self.args = args
-        self.max_lights = args.max_lights
-        self.grid_size = args.grid_size
-        self.decay_model = args.decay_model
-        self.sigma = args.sigma
-
-    def reset(self):
-        self.N = np.random.randint(args.min_lights, args.max_lights + 1)
-        self.positions_raw = np.random.uniform(0, 1, size=(self.N, 2)).astype(np.float32)
-        self.positions_padded = np.zeros((self.max_lights, 2), dtype=np.float32)
-        self.positions_padded[:self.N] = self.positions_raw
-        self.all_mask = np.zeros(self.max_lights, dtype=bool)
-        self.all_mask[:self.N] = True
-        self.hues = np.zeros(self.N, dtype=np.float32)
-        self.values = np.zeros(self.N, dtype=np.float32)
-        self.light_indices = np.random.permutation(self.N)
-        self.current_idx = 0
-
-        # 随机目标（模仿训练）
-        mode = random.choice([0, 1])
-        if mode == 0:
-            num_src = np.random.randint(1, 6)
-            src_pos = np.random.uniform(0, 1, (num_src, 2))
-            src_hues = np.random.uniform(0, 1.0, num_src)
-            src_vals = np.random.uniform(0, 1.0, num_src)
-            result = compute_mixed_lighting(
-                src_pos, src_hues, src_vals,
-                grid_size=self.grid_size, decay_model=self.decay_model, sigma=self.sigma
-            )
-        else:
-            n_peaks = np.random.randint(1, 6)
-            hue_hist = np.ones(360) * 0.001
-            for _ in range(n_peaks):
-                peak_pos = np.random.randint(0, 360)
-                peak_weight = np.random.uniform(0.5, 1.0)
-                for offset in range(-10, 11):
-                    idx = (peak_pos + offset) % 360
-                    hue_hist[idx] += peak_weight * np.exp(-0.5 * (offset / 3.0) ** 2)
-            hue_hist /= hue_hist.sum()
-            mean_value = np.random.uniform(0.0, 1.0)
-            max_value = min(1.0, mean_value * np.random.uniform(1.2, 1.5))
-            result = {'hue_histogram': hue_hist, 'mean_value': mean_value, 'max_value': max_value}
-
-        self.target_hue_hist = result['hue_histogram'].astype(np.float32)
-        self.target_mean_value = result['mean_value']
-        self.target_max_value = result['max_value']
-
-        self.history_positions = np.zeros((self.max_lights, 2), dtype=np.float32)
-        self.history_actions = np.zeros((self.max_lights, 2), dtype=np.float32)
-        self.history_mixed_hue = np.zeros((self.max_lights, 360), dtype=np.float32)
-        self.history_mixed_value = np.zeros((self.max_lights, 1), dtype=np.float32)
-
-        current_hue_hist, current_mean_val, _ = self._compute_current_mixed()
-        state = self._build_state(
-            current_position=self.positions_raw[self.light_indices[0]],
-            current_hue_hist=current_hue_hist,
-            current_mean_val=current_mean_val
-        )
-        return state, self.positions_raw, self.N, self.target_hue_hist, self.target_mean_value
-
-    def _compute_current_mixed(self):
-        mask = self.values > 0
-        if not np.any(mask):
-            return np.ones(360) / 360.0, 0.0, 0.0
-        result = compute_mixed_lighting(
-            positions=self.positions_raw[mask],
-            hues=self.hues[mask],
-            values=self.values[mask],
-            grid_size=self.grid_size,
-            decay_model=self.decay_model,
-            sigma=self.sigma
-        )
-        return result['hue_histogram'], result['mean_value'], result['max_value']
-
-    def _build_state(self, current_position, current_hue_hist, current_mean_val):
-        state = {
-            'target_hue': self.target_hue_hist,
-            'target_value': np.array([self.target_mean_value], dtype=np.float32),
-            'all_positions': self.positions_padded,
-            'all_mask': self.all_mask,
-            'history_positions': self.history_positions,
-            'history_actions': self.history_actions,
-            'history_mixed_hue': self.history_mixed_hue,
-            'history_mixed_value': self.history_mixed_value,
-            'current_position': current_position.reshape(1, 2).astype(np.float32),
-            'current_mixed_hue': current_hue_hist.reshape(1, 360).astype(np.float32),
-            'current_mixed_value': np.array([current_mean_val], dtype=np.float32).reshape(1, 1),
-            't': self.current_idx + 1
-        }
-        return state
-
-    def step(self, action, positions_raw, light_indices):
-        hue = np.clip(action[0], 0.0, 1.0)
-        value = np.clip(action[1], 0.0, 1.0)
-        light_id = light_indices[self.current_idx]
-
-        hue_before, mean_before, _ = self._compute_current_mixed()
-        self.hues[light_id] = hue
-        self.values[light_id] = value
-        hue_after, mean_after, _ = self._compute_current_mixed()
-
-        self.history_positions[self.current_idx] = positions_raw[light_id]
-        self.history_actions[self.current_idx] = [hue, value]
-        self.history_mixed_hue[self.current_idx] = hue_before
-        self.history_mixed_value[self.current_idx] = [mean_before]
-
-        self.current_idx += 1
-        done = self.current_idx >= self.N
-
-        if not done:
-            next_position = positions_raw[light_indices[self.current_idx]]
-            next_state = self._build_state(
-                current_position=next_position,
-                current_hue_hist=hue_after,
-                current_mean_val=mean_after
-            )
-        else:
-            next_state = None
-
-        return next_state, done, mean_after
-
-
-# ===================== 模型推理 =====================
-def run_inference(model, env):
-    state, positions_raw, N, gt_hist, gt_mean = env.reset()
-    light_indices = env.light_indices  # 保存顺序
-
-    hues_pred = np.zeros(N, dtype=np.float32)
-    values_pred = np.zeros(N, dtype=np.float32)
-
-    step = 0
-    done = False
-    while not done:
-        state_tensor = {
-            k: torch.from_numpy(v).unsqueeze(0).to(device) if isinstance(v, np.ndarray) else v
-            for k, v in state.items()
-        }
-
-        with torch.no_grad():
-            action_raw = model(state_tensor)
-            action = action_raw.squeeze(0).cpu().numpy()
-
-        next_state, done, mean_after = env.step(action, positions_raw, light_indices)
-
-        hue, value = action
-        light_id = light_indices[step]
-        hues_pred[light_id] = hue
-        values_pred[light_id] = value
-
-        state = next_state
-        step += 1
-
-    return hues_pred * 360, values_pred, gt_hist, gt_mean
-
-def visualize_comparison(positions, hues_pred, values_pred, gt_hist, gt_mean):
-    pred_result = compute_mixed_lighting(
-        positions, hues_pred, values_pred,
-        grid_size=args.grid_size, decay_model=args.decay_model, sigma=args.sigma
+    # 计算混合结果
+    mixed = compute_mixed_lighting(
+        positions=positions,
+        hues=hues,
+        values=values,
+        grid_size=grid_size,
+        decay_model=decay_model,
+        sigma=sigma
     )
 
-    # 计算 GT 主色相（加权平均 hue）
-    hues = np.arange(360)
-    main_gt_hue = np.sum(hues * gt_hist) % 360
+    value_map_mixed = mixed['value_map']
+    hue_map_mixed = mixed['mixed_hue_map']
 
-    # 创建 GT 单一色块（全图一个颜色）
-    h, w = args.grid_size
-    hsv_gt = np.full((h, w, 3), 0.0)  # 全图初始化
-    hsv_gt[..., 0] = main_gt_hue / 360.0
-    hsv_gt[..., 1] = 0.85           # 饱和度稍高，看得清楚
-    hsv_gt[..., 2] = np.clip(gt_mean * 1.5, 0.1, 1.0)  # 亮度稍放大，避免太暗
-    rgb_gt = hsv_to_rgb(hsv_gt)
+    n_plots = N + 1 + (1 if show_mixed_hue else 0)
+    nrows = (n_plots + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, dpi=120, squeeze=False)
+    axes = axes.ravel()
 
-    fig = plt.figure(figsize=(18, 12))
+    h, w = grid_size
+    yy, xx = np.mgrid[0:h, 0:w]
+    grid_yx = np.stack([xx, yy], axis=-1).astype(float)
 
-    # 1. GT Hue Histogram
-    ax1 = fig.add_subplot(2, 2, 1)
-    ax1.bar(np.arange(360), gt_hist, width=1, color='skyblue')
-    ax1.set_title(f"Ground Truth Hue Histogram\n(mean={gt_mean:.3f})")
-    ax1.set_xlim(0, 360)
-    ax1.set_xlabel("Hue (degree)")
+    pos_norm = positions.copy()
+    if pos_norm.max() > 1.5:
+        pos_norm[:, 0] /= w
+        pos_norm[:, 1] /= h
 
-    # 2. Pred Hue Histogram
-    ax2 = fig.add_subplot(2, 2, 2)
-    ax2.bar(np.arange(360), pred_result['hue_histogram'], width=1, color='lightcoral')
-    ax2.set_title(f"Predicted Hue Histogram")
-    ax2.set_xlim(0, 360)
-    ax2.set_xlabel("Hue (degree)")
+    diag = np.sqrt(w ** 2 + h ** 2)
+    sigma_pix = sigma * diag
 
-    # 3. GT Approx Color Block（右上角：单一色块）
-    ax3 = fig.add_subplot(2, 2, 3)
-    ax3.imshow(rgb_gt)
-    ax3.set_title(f"Ground Truth Approx. Color Block")
-    ax3.axis('off')
+    plot_idx = 0
 
-    # 4. Pred Approx Color Map
-    ax5 = fig.add_subplot(2, 2, 4)
-    hsv_pred = np.zeros((*args.grid_size, 3))
-    hsv_pred[..., 0] = pred_result['mixed_hue_map'] / 360.0
-    hsv_pred[..., 1] = 0.9
-    hsv_pred[..., 2] = np.clip(pred_result['value_map'] / (pred_result['value_map'].max() + 1e-8), 0, 1)
-    rgb_pred = hsv_to_rgb(hsv_pred)
-    ax5.imshow(rgb_pred)
-    ax5.scatter(positions[:,0]*args.grid_size[1], positions[:,1]*args.grid_size[0], c='white', s=50, edgecolor='black')
-    ax5.set_title("Predicted Approx. Color Map")
-    ax5.axis('off')
+    for i in range(N):
+        dy = grid_yx[..., 1] - pos_norm[i, 1] * h
+        dx = grid_yx[..., 0] - pos_norm[i, 0] * w
+        dist2 = dx * dx + dy * dy
 
+        if decay_model == "gaussian":
+            weight = np.exp(-dist2 / (2 * sigma_pix ** 2))
+        elif decay_model == "inverse_square":
+            dist = np.sqrt(dist2 + 1e-8)
+            weight = 1.0 / (dist ** 2)
+        else:
+            weight = np.ones((h, w))
 
-    plt.suptitle("Ground Truth vs Model Prediction Comparison", fontsize=16)
+        weight = np.clip(weight / (weight.max() + 1e-8), 0, 1)
+
+        hsv = np.zeros((h, w, 3))
+        hsv[..., 0] = hues[i] / 360.0
+        hsv[..., 1] = 0.88
+        hsv[..., 2] = weight * values_norm[i]
+
+        rgb = hsv_to_rgb(hsv)
+
+        ax = axes[plot_idx]
+        ax.imshow(rgb)
+        ax.scatter(pos_norm[i, 0] * w, pos_norm[i, 1] * h,
+                   c='white', s=100, edgecolor='black', linewidth=1.5, zorder=10)
+        ax.set_title(f"Light {i + 1}\nHue={hues[i]:.0f}°  Val={values_norm[i]:.2f}")
+        ax.axis('off')
+        plot_idx += 1
+
+    # 混合亮度图
+    ax = axes[plot_idx]
+    im = ax.imshow(value_map_mixed, cmap='hot', vmin=0, vmax=value_map_mixed.max())
+    ax.scatter(pos_norm[:, 0] * w, pos_norm[:, 1] * h,
+               c='white', s=100, edgecolor='black', linewidth=1.5, zorder=10)
+    ax.set_title("Mixed Brightness")
+    ax.axis('off')
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Intensity')
+    plot_idx += 1
+
+    # 混合色相图
+    if show_mixed_hue:
+        ax = axes[plot_idx]
+        hsv_mixed = np.zeros((h, w, 3))
+        hsv_mixed[..., 0] = hue_map_mixed / 360.0
+        hsv_mixed[..., 1] = 0.92
+        hsv_mixed[..., 2] = np.clip(value_map_mixed / (value_map_mixed.max() + 1e-8), 0, 1)
+        rgb_mixed = hsv_to_rgb(hsv_mixed)
+        ax.imshow(rgb_mixed)
+        ax.scatter(pos_norm[:, 0] * w, pos_norm[:, 1] * h,
+                   c='white', s=100, edgecolor='black', linewidth=1.5, zorder=10)
+        ax.set_title("Mixed Color")
+        ax.axis('off')
+        plot_idx += 1
+
+    for i in range(plot_idx, len(axes)):
+        axes[i].axis('off')
+
+    fig.suptitle(f"{title_prefix}  (N={N})", fontsize=16, y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
-# ===================== 主程序 =====================
+
+# ====================== 从直方图真实采样灯光配置 ======================
+def sample_lights_from_hist(target_hue_hist, target_value_hist, N, positions, seed=42):
+    """从目标直方图中真实采样灯光配置，使 GT 视觉效果更接近真实分布"""
+    np.random.seed(seed)
+
+    # Hue 采样（CDF 方式，保证分布一致）
+    hue_cdf = np.cumsum(target_hue_hist)
+    hue_cdf /= hue_cdf[-1]
+    u = np.random.rand(N)
+    hues = np.searchsorted(hue_cdf, u).astype(float)
+    hues += np.random.normal(0, 4, N)  # 轻微扩散，更自然
+    hues = np.clip(hues % 360, 0, 359)
+
+    # Value 采样
+    value_cdf = np.cumsum(target_value_hist)
+    value_cdf /= value_cdf[-1]
+    u = np.random.rand(N)
+    value_bins = np.linspace(0, 1, 100)
+    values = value_bins[np.searchsorted(value_cdf, u)]
+    values += np.random.normal(0, 0.04, N)
+    values = np.clip(values, 0.05, 1.0)
+
+    # # 位置：轻微扰动的网格 + 随机，避免完全随机太乱
+    # grid = np.linspace(0.15, 0.85, int(np.ceil(np.sqrt(N))))
+    # xx, yy = np.meshgrid(grid, grid)
+    # positions = np.column_stack([xx.ravel()[:N], yy.ravel()[:N]])
+    # positions += np.random.normal(0, 0.08, positions.shape)
+    # positions = np.clip(positions, 0.05, 0.95)
+
+    return positions, hues, values
+
+
+# ====================== 原有测试函数（基本不变） ======================
+def parse_test_args():
+    parser = argparse.ArgumentParser(description='Test Lighting Decomposition Model')
+    parser.add_argument('--model_path', type=str, default='./models/model.pth')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 环境参数（与训练完全一致）
+    parser.add_argument('--grid_size', type=int, nargs=2, default=[120, 160])
+    parser.add_argument('--decay_model', type=str, default='gaussian')
+    parser.add_argument('--sigma', type=float, default=0.18)
+    parser.add_argument('--value_power', type=float, default=1.0)
+    parser.add_argument('--eps', type=float, default=1e-8)
+    parser.add_argument('--min_lights', type=int, default=8)
+    parser.add_argument('--max_lights', type=int, default=8)
+    parser.add_argument('--target_gen_modes', type=int, nargs='+', default=[1])
+    parser.add_argument('--simple_layout', action='store_true', default=True)
+
+    # 模型参数
+    parser.add_argument('--d_model', type=int, default=64)
+    parser.add_argument('--nhead', type=int, default=4)
+    parser.add_argument('--num_layers', type=int, default=3)
+
+    # 其他训练参数（保持完整性）
+    parser.add_argument('--total_timesteps', type=int, default=200000)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--buffer_capacity', type=int, default=100000)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--tau', type=float, default=0.005)
+    parser.add_argument('--lr_actor', type=float, default=3e-4)
+    parser.add_argument('--lr_critic', type=float, default=3e-4)
+    parser.add_argument('--policy_delay', type=int, default=2)
+    parser.add_argument('--exploration_noise', type=float, default=0.1)
+    parser.add_argument('--target_noise', type=float, default=0.1)
+    parser.add_argument('--noise_clip', type=float, default=0.1)
+    parser.add_argument('--updates_per_step', type=int, default=1)
+    parser.add_argument('--max_grad_norm', type=float, default=1.0)
+
+    parser.add_argument('--log_file', type=str, default='training_log.txt')
+    parser.add_argument('--log_file_eval', type=str, default='eval_log.txt')
+    parser.add_argument('--save_dir', type=str, default='./models')
+    parser.add_argument('--model_name', type=str, default='model.pth')
+    parser.add_argument('--print_freq', type=int, default=10)
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--no_cuda', action='store_true')
+
+    # 奖励参数
+    parser.add_argument('--hue_improve_coef', type=float, default=4.0)
+    parser.add_argument('--value_improve_coef', type=float, default=1.0)
+    parser.add_argument('--terminal_hue_coef', type=float, default=5.0)
+    parser.add_argument('--terminal_value_coef', type=float, default=1.5)
+    parser.add_argument('--success_hue_thresh', type=float, default=0.2)
+    parser.add_argument('--success_value_thresh', type=float, default=0.2)
+    parser.add_argument('--success_bonus', type=float, default=10.0)
+    parser.add_argument('--hue_match_coef', type=float, default=8.0)
+    parser.add_argument('--value_match_coef', type=float, default=3.0)
+
+    return parser.parse_args()
+
+
+def load_model_and_env(args):
+    device = torch.device(args.device)
+    print(f"Using device: {device}")
+
+    env = LightingEnv(args)
+    env.seed(args.seed)
+
+    model = SeqLight(
+        d_model=64, nhead=4, num_layers=3
+    ).to(device)
+
+    if not Path(args.model_path).exists():
+        raise FileNotFoundError(f"Model not found: {args.model_path}")
+
+    checkpoint = torch.load(args.model_path, map_location=device)
+    model.load_state_dict(checkpoint.get('policy_state_dict', checkpoint))
+    model.eval()
+    print(f"Loaded model from: {args.model_path}")
+
+    return model, env, device
+
+
+def run_one_episode(model, env, device, N=8):
+    state = env.reset(N=N)
+    done = False
+
+    while not done:
+        with torch.no_grad():
+            state_tensor = {
+                k: torch.from_numpy(v).unsqueeze(0).to(device).float()
+                if isinstance(v, np.ndarray) else torch.tensor([v]).to(device)
+                for k, v in state.items()
+            }
+            action = model(state_tensor).cpu().numpy().flatten()
+            action = np.clip(action, 0.0, 1.0)
+
+        next_state, _, done, info = env.step(action)
+        state = next_state
+
+    final_hue_hist, final_value_hist = env._compute_current_mixed()
+
+    return {
+        'target_hue': env.target_hue_hist,
+        'target_value': env.target_value_hist,
+        'pred_hue': final_hue_hist,
+        'pred_value': final_value_hist,
+        'final_hue_err': info['hue_err'],
+        'final_value_err': info['value_err'],
+        'mode': env.target_gen_mode,
+        'N': env.N
+    }
+
+
+def plot_compare(gt_hue, gt_value, pred_hue, pred_value, title_info=""):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    axes[0, 0].plot(gt_hue, color='C0');
+    axes[0, 0].set_title("Ground Truth Hue");
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 1].plot(pred_hue, color='C1');
+    axes[0, 1].set_title("Predicted Hue");
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[1, 0].plot(gt_value, color='C0');
+    axes[1, 0].set_title("Ground Truth Value");
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 1].plot(pred_value, color='C1');
+    axes[1, 1].set_title("Predicted Value");
+    axes[1, 1].grid(True, alpha=0.3)
+    fig.suptitle(title_info, fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+
+# ====================== 主程序 ======================
+def main():
+    args = parse_test_args()
+    model, env, device = load_model_and_env(args)
+
+    for i in range(3):  # 跑 3 次不同随机目标
+        # print(f"\n{'=' * 60}\n=== Test Episode {i + 1} (N=10) ===\n{'=' * 60}")
+
+        result = run_one_episode(model, env, device, N=8)
+
+        title = (f"N={result['N']} | mode={result['mode']} | "
+                 f"HueErr={result['final_hue_err']:.4f} | ValueErr={result['final_value_err']:.4f}")
+
+        plot_compare(
+            result['target_hue'], result['target_value'],
+            result['pred_hue'], result['pred_value'],
+            title_info=title
+        )
+
+        # ==================== 更真实的 Ground Truth 可视化 ====================
+        final_mask = env.values != 0
+
+        pos_gt, hues_gt, vals_gt = sample_lights_from_hist(
+            result['target_hue'], result['target_value'], result['N'], env.positions_raw[final_mask], seed=100 + i
+        )
+        visualize_individual_and_mixed_lights(
+            positions=pos_gt, hues=hues_gt, values=vals_gt,
+            grid_size=args.grid_size, decay_model=args.decay_model, sigma=args.sigma,
+            ncols=4, show_mixed_hue=True, figsize=(17, 11),
+            title_prefix="Ground Truth"
+        )
+
+        # ==================== Agent 生成结果可视化 ====================
+        visualize_individual_and_mixed_lights(
+            positions=env.positions_raw[final_mask],
+            hues=env.hues[final_mask],
+            values=env.values[final_mask],
+            grid_size=args.grid_size, decay_model=args.decay_model, sigma=args.sigma,
+            ncols=4, show_mixed_hue=True, figsize=(17, 11),
+            title_prefix="Generation Result"
+        )
+
+
 if __name__ == "__main__":
-    model = load_model(args.model_path)
-    env = TestEnv(args)
-
-    print("Running model inference (greedy, no noise)...")
-    hues_pred, values_pred, gt_hist, gt_mean = run_inference(model, env)
-
-    # 随机生成 gt 灯光用于可视化对比
-    N = len(hues_pred)
-    positions = env.positions_raw  # 从 env 拿真实的测试位置
-
-    visualize_comparison(positions, hues_pred, values_pred, gt_hist, gt_mean)
+    main()

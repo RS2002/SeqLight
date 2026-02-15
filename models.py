@@ -112,16 +112,14 @@ class SeqLight(nn.Module):
         self.pos_encoder = MLP([2,d_model,d_model])
         self.action_encoder = MLP([2,d_model,d_model])
         self.hue_encoder = MLP([360,d_model*2,d_model])
-        self.value_encoder = MLP([1,d_model,d_model])
+        self.value_encoder = MLP([100,d_model,d_model])
         self.global_pos_encoder = GlobalPositionEncoder(self.pos_encoder, d_model, nhead)
 
-        # # 两个 dummy action
-        # self.dummy_target = nn.Parameter(torch.randn(1, 1, d_model))
-        # self.dummy_current = nn.Parameter(torch.randn(1, 1, d_model))
+        self.dummy_act = nn.Parameter(torch.randn(d_model))
 
         # 新增：将四个 embedding concat 后投影回 d_model
         self.token_proj = nn.Sequential(
-            nn.Linear(d_model * 3, d_model * 2),
+            nn.Linear(d_model * 4, d_model * 2),
             nn.GELU(),
             nn.Linear(d_model * 2, d_model),
             nn.LayerNorm(d_model)
@@ -155,9 +153,12 @@ class SeqLight(nn.Module):
         历史是 (B, max_lights, ...) 但只使用前 (t-1) 步
         """
         B = batch_dict['target_hue'].shape[0]
-        t = batch_dict['t']  # 当前是第 t 步（从1开始）
-        device = next(self.parameters()).device
-        max_hist = batch_dict['history_positions'].shape[1]  # max_lights
+        t = batch_dict['t']
+        # 将张量 t 转换为标量（批内所有样本 t 相同）
+        if isinstance(t, torch.Tensor):
+            t = t[0].item()
+        # device = next(self.parameters()).device
+        # max_hist = batch_dict['history_positions'].shape[1]  # max_lights
 
         # ----- 1. 目标 token（固定1个）-----
         global_pos = self.global_pos_encoder(
@@ -166,14 +167,15 @@ class SeqLight(nn.Module):
         )  # (B, d_model)
         target_hue_emb = self.hue_encoder(batch_dict['target_hue'])  # (B, d_model)
         target_value_emb = self.value_encoder(batch_dict['target_value'])  # (B, d_model)
-        target_concat = torch.cat([global_pos, target_hue_emb, target_value_emb], dim=-1)
+        dummy_act_emb = self.dummy_act.unsqueeze(0).expand(B, -1)  # (B, d_model)
+        target_concat = torch.cat([global_pos, dummy_act_emb, target_hue_emb, target_value_emb], dim=-1)
         target_token = self.token_proj(target_concat).unsqueeze(1)  # (B, 1, d_model)
 
         # ----- 2. 当前 token（固定1个）-----
         cur_pos_emb = self.pos_encoder(batch_dict['current_position'].squeeze(1))  # (B, d_model)
         cur_hue_emb = self.hue_encoder(batch_dict['current_mixed_hue'].squeeze(1))
         cur_val_emb = self.value_encoder(batch_dict['current_mixed_value'].squeeze(1))
-        cur_concat = torch.cat([cur_pos_emb, cur_hue_emb, cur_val_emb], dim=-1)
+        cur_concat = torch.cat([cur_pos_emb, dummy_act_emb, cur_hue_emb, cur_val_emb], dim=-1)
         current_token = self.token_proj(cur_concat).unsqueeze(1)  # (B, 1, d_model)
 
         # ----- 3. 历史 token（取前 t-1 步，有效长度） -----
@@ -181,25 +183,29 @@ class SeqLight(nn.Module):
             hist_len = t - 1
             # 截取前 hist_len 步（因为是按决策顺序填充的）
             hist_pos = batch_dict['history_positions'][:, :hist_len, :]  # (B, hist_len, 2)
+            hist_act = batch_dict['history_actions'][:, :hist_len, :]  # (B, hist_len, 2)
             hist_hue = batch_dict['history_mixed_hue'][:, :hist_len, :]  # (B, hist_len, 360)
-            hist_val = batch_dict['history_mixed_value'][:, :hist_len, :]  # (B, hist_len, 1)
+            hist_val = batch_dict['history_mixed_value'][:, :hist_len, :]  # (B, hist_len, 100)
 
             # 展平后批量编码
             B_flat = B * hist_len
             hist_pos_flat = hist_pos.reshape(B_flat, 2)
+            hist_act_flat = hist_act.reshape(B_flat, 2)
             hist_hue_flat = hist_hue.reshape(B_flat, 360)
-            hist_val_flat = hist_val.reshape(B_flat, 1)
+            hist_val_flat = hist_val.reshape(B_flat, 100)
 
             pos_emb_flat = self.pos_encoder(hist_pos_flat)  # (B*hist_len, d_model)
+            act_emb_flat = self.action_encoder(hist_act_flat)  # (B*hist_len, d_model)
             hue_emb_flat = self.hue_encoder(hist_hue_flat)
             val_emb_flat = self.value_encoder(hist_val_flat)
 
             # 恢复形状
             pos_emb = pos_emb_flat.view(B, hist_len, self.d_model)
+            act_emb = act_emb_flat.view(B, hist_len, self.d_model)
             hue_emb = hue_emb_flat.view(B, hist_len, self.d_model)
             val_emb = val_emb_flat.view(B, hist_len, self.d_model)
 
-            hist_concat = torch.cat([pos_emb, hue_emb, val_emb], dim=-1)  # (B, hist_len, d_model*3)
+            hist_concat = torch.cat([pos_emb, act_emb, hue_emb, val_emb], dim=-1)  # (B, hist_len, d_model*4)
             hist_tokens = self.token_proj(hist_concat)  # (B, hist_len, d_model)
 
             # 完整序列：目标 + 历史 + 当前
@@ -247,12 +253,12 @@ class SeqLight(nn.Module):
 
         参数 batch_dict 必须包含:
             target_hue:      (B, 360)
-            target_value:    (B, 1)
+            target_value:    (B, 100)
             all_positions:   (B, N, 2)
             all_mask:        (B, N)          # bool，有效位置掩码
             step_positions:  (B, T, 2)       # 每个时间步被调节的灯光位置
             step_mixed_hue:  (B, T, 360)     # 每个时间步混合后的色相直方图
-            step_mixed_value:(B, T, 1)       # 每个时间步混合后的平均亮度
+            step_mixed_value:(B, T, 100)       # 每个时间步混合后的平均亮度
 
         返回:
             dict {
@@ -274,23 +280,24 @@ class SeqLight(nn.Module):
 
         target_hue_emb = self.hue_encoder(batch_dict['target_hue'])   # (B, d_model)
         target_value_emb = self.value_encoder(batch_dict['target_value']) # (B, d_model)
-
-        target_concat = torch.cat([global_pos, target_hue_emb, target_value_emb], dim=-1)  # (B, d_model*3)
+        dummy_act_emb = self.dummy_act.unsqueeze(0).expand(B, -1)  # (B, d_model)
+        target_concat = torch.cat([global_pos, dummy_act_emb, target_hue_emb, target_value_emb], dim=-1)  # (B, d_model*4)
         target_token = self.token_proj(target_concat).unsqueeze(1)   # (B, 1, d_model)
 
         # ----- 2. 构建每个时间步的 token -----
         T = batch_dict['step_positions'].size(1)
 
-        # 将 (B, T, ...) 合并为 (B*T, ...) 一次性编码，提高并行效率
+        # 将 (B, T, ...) 合并为 (B*T, ...) 一次性编码
         pos_flat = batch_dict['step_positions'].view(B * T, 2)               # (B*T, 2)
         hue_flat = batch_dict['step_mixed_hue'].view(B * T, 360)            # (B*T, 360)
-        val_flat = batch_dict['step_mixed_value'].view(B * T, 1)            # (B*T, 1)
+        val_flat = batch_dict['step_mixed_value'].view(B * T, 100)            # (B*T, 100)
 
         pos_emb = self.pos_encoder(pos_flat)            # (B*T, d_model)
         hue_emb = self.hue_encoder(hue_flat)            # (B*T, d_model)
         val_emb = self.value_encoder(val_flat)          # (B*T, d_model)
+        act_emb_flat = self.dummy_act.unsqueeze(0).expand(B * T, -1)  # (B*T, d_model)
 
-        step_concat = torch.cat([pos_emb, hue_emb, val_emb], dim=-1)   # (B*T, d_model*3)
+        step_concat = torch.cat([pos_emb, act_emb_flat, hue_emb, val_emb], dim=-1)   # (B*T, d_model*4)
         step_token = self.token_proj(step_concat)                     # (B*T, d_model)
         step_tokens = step_token.view(B, T, self.d_model)             # (B, T, d_model)
 
@@ -362,16 +369,16 @@ if __name__ == "__main__":
 
     batch_dict = {
         'target_hue': torch.randn(B, 360).cuda(),
-        'target_value': torch.randn(B, 1).cuda(),
+        'target_value': torch.randn(B, 100).cuda(),
         'all_positions': torch.rand(B, 12, 2).cuda(),
         'all_mask': torch.ones(B, 12, dtype=torch.bool).cuda(),
         'history_positions': torch.rand(B, t - 1, 2).cuda(),
         'history_actions': (torch.rand(B, t - 1, 2) * 2 - 1).cuda(),
         'history_mixed_hue': torch.randn(B, t - 1, 360).cuda(),
-        'history_mixed_value': torch.randn(B, t - 1, 1).cuda(),
+        'history_mixed_value': torch.randn(B, t - 1, 100).cuda(),
         'current_position': torch.rand(B, 1, 2).cuda(),
         'current_mixed_hue': torch.randn(B, 1, 360).cuda(),
-        'current_mixed_value': torch.randn(B, 1, 1).cuda(),
+        'current_mixed_value': torch.randn(B, 1, 100).cuda(),
         't': t,
     }
 
@@ -394,12 +401,12 @@ if __name__ == "__main__":
 
     batch_dict = {
         'target_hue': torch.randn(B, 360).cuda(),
-        'target_value': torch.randn(B, 1).cuda(),
+        'target_value': torch.randn(B, 100).cuda(),
         'all_positions': torch.rand(B, N, 2).cuda(),
         'all_mask': torch.ones(B, N, dtype=torch.bool).cuda(),
         'step_positions': torch.rand(B, T, 2).cuda(),
         'step_mixed_hue': torch.randn(B, T, 360).cuda(),
-        'step_mixed_value': torch.randn(B, T, 1).cuda(),
+        'step_mixed_value': torch.randn(B, T, 100).cuda(),
     }
 
     # ------------------- 前向测试（不计算梯度，仅验证形状） -------------------
@@ -429,12 +436,12 @@ if __name__ == "__main__":
     B1 = 2
     batch_single = {
         'target_hue': torch.randn(B1, 360).cuda(),
-        'target_value': torch.randn(B1, 1).cuda(),
+        'target_value': torch.randn(B1, 100).cuda(),
         'all_positions': torch.rand(B1, N, 2).cuda(),
         'all_mask': torch.ones(B1, N, dtype=torch.bool).cuda(),
         'step_positions': torch.rand(B1, 1, 2).cuda(),
         'step_mixed_hue': torch.randn(B1, 1, 360).cuda(),
-        'step_mixed_value': torch.randn(B1, 1, 1).cuda(),
+        'step_mixed_value': torch.randn(B1, 1, 100).cuda(),
     }
     # 轨迹方式（不跟踪梯度以便比较）
     with torch.no_grad():
@@ -451,17 +458,15 @@ if __name__ == "__main__":
             'history_positions': torch.empty(B1, 0, 2).cuda(),
             'history_actions': torch.empty(B1, 0, 2).cuda(),
             'history_mixed_hue': torch.empty(B1, 0, 360).cuda(),
-            'history_mixed_value': torch.empty(B1, 0, 1).cuda(),
+            'history_mixed_value': torch.empty(B1, 0, 100).cuda(),
             'current_position': batch_single['step_positions'],
             'current_mixed_hue': batch_single['step_mixed_hue'],
             'current_mixed_value': batch_single['step_mixed_value'],
             't': 1,
         }
-        raw_original = model(batch_original)
-        action_original = torch.sigmoid(raw_original)
+        action_original = model(batch_original)
         q1_original, _ = model(batch_original, action=action_original)
 
     print(f"Action difference:  {(action_traj.squeeze(1) - action_original).abs().max().item():.6f}")
     print(f"Q1 difference:      {(q1_traj.squeeze(1) - q1_original.squeeze(1)).abs().max().item():.6f}")
     print("[Consistency] Should be near zero (difference < 1e-5).")
-

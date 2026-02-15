@@ -1,126 +1,112 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-
 def compute_mixed_lighting(
-    positions: np.ndarray,       # (N, 2)  [x, y] 或 [列, 行]
-    hues: np.ndarray,            # (N,)     0~1
-    values: np.ndarray,          # (N,)     建议 0~1 范围，内部会归一化
-    grid_size=(120, 160),        # (高度, 宽度) 建议比例接近舞台
+    positions: np.ndarray,       # (N, 2) normalized [0,1]
+    hues: np.ndarray,            # (N,) degrees 0~360
+    values: np.ndarray,          # (N,) 0~1
+    grid_size=(120, 160),
     decay_model="gaussian",
-    sigma=0.18,                  # 相对画面对角线的比例
-    value_power=1.0,             # value 的非线性指数（可选 gamma 校正）
-    eps=1e-8
+    sigma=0.18,                  # for gaussian, relative to diag
+    alpha=1.0,                   # for inverse_square, weight = 1 / (dist^alpha + eps)
+    value_power=1.0,
+    eps=1e-6,
+    max_value_clip=True,
+    clip_factor=2.5,             # for soft clip: 1 - exp(-v * clip_factor)
 ) -> dict:
     """
-    计算多灯叠加后的整体 hue 分布 与 value 空间分布
+    计算多点光源叠加后的 HV 分布（改进版）
     """
     N = len(hues)
     if N == 0:
         return {
-            'hue_histogram': np.zeros(360),
-            'value_map': np.zeros(grid_size),
+            'hue_histogram': np.zeros(360, dtype=np.float32),
+            'value_histogram': np.zeros(100, dtype=np.float32),
+            'value_map': np.zeros(grid_size, dtype=np.float32),
             'mean_value': 0.0,
-            'max_value': 0.0
+            'max_value': 0.0,
+            'mixed_hue_map': np.zeros(grid_size, dtype=np.float32),
+            'peak_hue': 0.0
         }
 
-    # 统一 value & hue 到 [0,1]
-    values = np.asarray(values, dtype=float)
-    if values.max() > 1.5:           # 粗暴判断是否 0~255
-        values = values / 255.0
-    values = np.clip(values, 0, None)
-    values **= value_power           # 可选 gamma 校正
+    # 预处理
+    positions = np.asarray(positions, dtype=np.float32)
+    hues = np.asarray(hues, dtype=np.float32) % 360
+    values = np.clip(np.asarray(values, dtype=np.float32), 0.0, None)
+    values = values ** value_power
 
-    if hues.max() > 1.5:           # 粗暴判断是否 0~359
-        hues = hues / 360.0
-    hues = np.clip(hues, 0, None)
-    hues *= 360.0
-
-    # 建立网格坐标 (像素中心)
+    # 网格
     h, w = grid_size
     yy, xx = np.mgrid[0:h, 0:w]
-    grid_yx = np.stack([xx, yy], axis=-1).astype(float)   # (h,w,2)
+    grid_yx = np.stack([xx, yy], axis=-1).astype(np.float32)  # (h,w,2)
 
-    # 灯光位置归一化到 [0,1]×[0,1] 区间更稳定
-    pos_norm = positions.copy()
-    if pos_norm.max() > 2.0:   # 粗判是否已经是归一化坐标
-        pos_norm[:, 0] /= w
-        pos_norm[:, 1] /= h
+    # 向量化距离计算
+    pos_scaled = positions * np.array([w, h])  # (N,2)
+    pos_scaled = pos_scaled[:, None, None, :]  # (N,1,1,2)
+    grid_exp = grid_yx[None, ...]              # (1,h,w,2)
+    diff = grid_exp - pos_scaled               # (N,h,w,2)
+    dist2 = np.sum(diff**2, axis=-1)           # (N,h,w)
 
-    # 计算每个灯对每个网格的权重（贡献比例）
-    weight_map = np.zeros((N, h, w), dtype=np.float32)
-
-    if decay_model == "none":
-        weight_map[:] = 1.0 / N
-
-    elif decay_model == "gaussian":
-        # 每个灯贡献一个高斯
-        diag = np.sqrt(w**2 + h**2)          # 对角线长度 ≈ 最大距离
+    # 距离权重
+    if decay_model == "gaussian":
+        diag = np.sqrt(w**2 + h**2)
         sigma_pix = sigma * diag
-
-        for i in range(N):
-            dy = grid_yx[..., 1] - pos_norm[i, 1] * h
-            dx = grid_yx[..., 0] - pos_norm[i, 0] * w
-            dist2 = dx*dx + dy*dy
-            weight_map[i] = np.exp(-dist2 / (2 * sigma_pix**2))
-
+        weight_map = np.exp(-dist2 / (2 * sigma_pix**2))
     elif decay_model == "inverse_square":
-        for i in range(N):
-            dy = grid_yx[..., 1] - pos_norm[i, 1] * h
-            dx = grid_yx[..., 0] - pos_norm[i, 0] * w
-            dist = np.sqrt(dx*dx + dy*dy + eps)
-            weight_map[i] = 1.0 / (dist ** 2)
-
+        weight_map = 1.0 / (dist2 + eps) ** (alpha / 2.0)
+        weight_map /= weight_map.sum(axis=(1,2), keepdims=True) + eps  # 可选norm per light
+    elif decay_model == "none":
+        weight_map = np.full((N, h, w), 1.0 / N, dtype=np.float32)
     else:
-        raise ValueError(f"unknown decay_model: {decay_model}")
+        raise ValueError(f"Unknown decay_model: {decay_model}")
 
-    # 归一化权重（每像素独立 softmax）
-    weight_sum = weight_map.sum(axis=0) + eps
-    weight_map /= weight_sum[None, ...]
+    # 亮度贡献
+    contrib = weight_map * values[:, None, None]  # (N, h, w)
+    value_per_pixel = contrib.sum(axis=0)         # (h, w)
 
-    # ------------------ hue 加权混合 ------------------
-    # 方法1：每个像素取加权平均色相（最常用，但跨 0/360 会断裂）
-    hue_rad = np.deg2rad(hues)[:, None, None]   # (N,1,1)
-    hue_x = np.sin(hue_rad)                     # (N,1,1)
-    hue_y = np.cos(hue_rad)
+    if max_value_clip:
+        value_per_pixel = 1.0 - np.exp(-value_per_pixel * clip_factor)
 
-    avg_sin = (weight_map * hue_x).sum(axis=0)  # (h,w)
-    avg_cos = (weight_map * hue_y).sum(axis=0)
-    mixed_hue_rad = np.arctan2(avg_sin, avg_cos)
-    mixed_hue = np.rad2deg(mixed_hue_rad) % 360
+    # Hue 混合
+    weight_for_hue = contrib / (value_per_pixel[None, ...] + eps)  # (N,h,w)
+    hue_rad = np.deg2rad(hues)[:, None, None]
+    avg_sin = (weight_for_hue * np.sin(hue_rad)).sum(axis=0)
+    avg_cos = (weight_for_hue * np.cos(hue_rad)).sum(axis=0)
+    mixed_hue = np.rad2deg(np.arctan2(avg_sin, avg_cos)) % 360
+    mixed_hue = np.where(value_per_pixel < 1e-5, 0, mixed_hue)
 
-    # 收集所有像素的 hue，用于直方图
-    hue_flat = mixed_hue.ravel()
-    hue_hist, _ = np.histogram(hue_flat, bins=360, range=(0, 360), density=True)
+    # 直方图（clip value for hist to [0,1]）
+    hist_value = np.clip(value_per_pixel, 0, 1)
+    hue_hist_raw, _ = np.histogram(mixed_hue.ravel(), bins=360, range=(0, 360))
+    hue_hist = hue_hist_raw.astype(np.float32)
+    hue_hist /= hue_hist.sum() + eps
 
-    # ------------------ value 叠加 ------------------
-    # 每个像素的亮度 = Σ (weight_i * value_i)
-    value_per_pixel = (weight_map * values[:, None, None]).sum(axis=0)  # (h,w)
+    value_hist_raw, _ = np.histogram(hist_value.ravel(), bins=100, range=(0.0, 1.0))
+    value_hist = value_hist_raw.astype(np.float32)
+    value_hist /= value_hist.sum() + eps
 
     # 统计
-    mean_v = float(value_per_pixel.mean())
-    max_v = float(value_per_pixel.max())
+    peak_bin = np.argmax(hue_hist)
+    peak_hue = float(peak_bin)
 
     return {
-        'hue_histogram': hue_hist,             # shape (360,), 归一化密度
-        'value_map': value_per_pixel,          # shape (h, w)
-        'mean_value': mean_v,
-        'max_value': max_v,
-        'mixed_hue_map': mixed_hue             # 可选：每个像素的代表色相 (h,w)
+        'hue_histogram': hue_hist,
+        'value_histogram': value_hist,
+        'value_map': value_per_pixel,
+        'mean_value': float(value_per_pixel.mean()),
+        'max_value': float(value_per_pixel.max()),
+        'mixed_hue_map': mixed_hue,
+        'peak_hue': peak_hue
     }
 
+# ============================= 测试代码 =============================
 if __name__ == '__main__':
-    # test
-    # 假设舞台是 160×120 的归一化坐标系
     positions = np.array([
-        [0.3, 0.2],  # 左前
-        [0.7, 0.2],  # 右前
-        [0.5, 0.8],  # 后方顶光
-        [0.1, 0.6],  # 左侧边光
+        [0.3, 0.2], [0.7, 0.2], [0.5, 0.8], [0.1, 0.6],
     ])
 
-    hues = np.array([30, 210, 0, 280])  # 暖白、冷白、红、紫
-    values = np.array([0.9, 0.65, 0.4, 0.55])
+    hues = np.array([30, 210, 50, 280])
+    values = np.array([0.9, 0.65, 0.1, 0.55])
 
     result = compute_mixed_lighting(
         positions, hues, values,
@@ -129,20 +115,28 @@ if __name__ == '__main__':
         sigma=0.20
     )
 
-    # 可视化
-    fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+    fig, axs = plt.subplots(1, 3, figsize=(15, 4))
 
     axs[0].imshow(result['value_map'], cmap='hot', vmin=0, vmax=1)
     axs[0].set_title("Brightness map")
     axs[0].scatter(positions[:, 0] * 160, positions[:, 1] * 120, c='white', edgecolor='black')
 
     axs[1].bar(np.arange(360), result['hue_histogram'], width=1)
-    axs[1].set_title("Global hue distribution")
+    axs[1].set_title(f"Hue distribution\n(peak hue = {result['peak_hue']:.0f}°)")
     axs[1].set_xlim(0, 360)
-    axs[1].set_xlabel("Hue (degree)")
+
+    # Value 占比直方图
+    bin_centers = np.linspace(0, 1, 101)[:-1] + 0.5/100
+    axs[2].bar(bin_centers, result['value_histogram'], width=1/100, color='purple')
+    axs[2].set_title("Value distribution (proportion)")
+    axs[2].set_xlim(0, 1)
+    axs[2].set_ylim(0, result['value_histogram'].max() * 1.1)
 
     plt.tight_layout()
     plt.show()
 
     print(f"平均亮度: {result['mean_value']:.3f}")
     print(f"最大亮度: {result['max_value']:.3f}")
+    print(f"hue 峰值位置: {result['peak_hue']:.0f}°")
+    print(f"value_histogram sum: {result['value_histogram'].sum():.6f}")   # 应接近 1.0
+    print(f"hue_histogram sum: {result['hue_histogram'].sum():.6f}")       # 应接近 1.0
