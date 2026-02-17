@@ -221,7 +221,7 @@ if __name__ == "__main__":
     parser.add_argument('--best_save_path', type=str, default='bc_best.pth')
     parser.add_argument('--latest_save_path', type=str, default='bc_latest.pth')
     # 日志文件
-    parser.add_argument('--log_file', type=str, default='training_log.txt', help='Path to save training log')
+    parser.add_argument('--log_file', type=str, default='bc_log.txt', help='Path to save training log')
 
     args = parser.parse_args()
     train_bc(args)

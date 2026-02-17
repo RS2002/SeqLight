@@ -57,7 +57,7 @@ def visualize_individual_and_mixed_lights(
     # 统一 value 到 [0,1]
     values_norm = np.asarray(values, dtype=float)
     if values_norm.max() > 1.5:
-        values_norm /= 255.0
+        values_norm /= 255.03
     values_norm = np.clip(values_norm, 0, 1)
 
     # 计算混合结果（复用原有函数）
@@ -204,7 +204,7 @@ def evaluate(env, policy, num_episodes, device, deterministic=True, plot=False):
 
     for ep in range(num_episodes):
         # 重置环境（随机目标分布）
-        state = env.reset()
+        state = env.reset(mode=1)
         done = False
         while not done:
             # 构建批处理字典（增加batch维度）
@@ -295,11 +295,11 @@ def main():
     parser.add_argument('--d_model', type=int, default=64)
     parser.add_argument('--nhead', type=int, default=4)
     parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--model_path', type=str, default="./bc_latest.pth", help='Path to trained model weights')
+    parser.add_argument('--model_path', type=str, default="./airl_latest.pth", help='Path to trained model weights')
 
     # 评估参数
     parser.add_argument('--num_episodes', type=int, default=3, help='Number of episodes to evaluate')
-    parser.add_argument('--deterministic', action='store_true', default=False, help='Use deterministic actions (mean)')
+    parser.add_argument('--deterministic', action='store_true', default=True, help='Use deterministic actions (mean)')
     parser.add_argument('--plot', action='store_true', default=True, help='Plot distribution comparisons for each episode')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--no_cuda', action='store_true', default=False, help='Disable CUDA')
