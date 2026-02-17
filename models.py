@@ -1,5 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
+from torch.distributions import VonMises, Beta
+
 
 class MLP(nn.Module):
     def __init__(self, layer_sizes = [64,64,64,1], arl = False, dropout = 0.0, bias = True):
@@ -141,11 +145,18 @@ class SeqLight(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
         # Actor head
-        self.actor_head =  MLP([d_model,d_model,2]) # hue_raw, value_raw
+        self.actor_head =  MLP([d_model,d_model,4]) # hue, value
 
-        # Twin Critic heads
-        self.critic_head1 =  MLP([d_model*2,d_model,1])
-        self.critic_head2 = MLP([d_model*2,d_model,1])
+        # Critic head
+        self.critic_head =  MLP([d_model,d_model,1])
+
+        # Reward head
+        self.reward_head =  MLP([d_model*2,d_model,1])
+
+        # Mixture head
+        self.hue_head = MLP([d_model*2, d_model, 360])
+        self.value_head = MLP([d_model*2, d_model, 100])
+        self.softmax = nn.Softmax(dim=-1)
 
     def _build_sequence(self, batch_dict):
         """
@@ -216,7 +227,7 @@ class SeqLight(nn.Module):
 
         return seq
 
-    def forward(self, batch_dict, action=None):
+    def forward(self, batch_dict, action=None, deterministic=False):
         seq = self._build_sequence(batch_dict)
         seq_len = seq.shape[1]
 
@@ -233,138 +244,86 @@ class SeqLight(nn.Module):
         hidden = self.transformer(seq, mask=causal_mask)
         last_hidden = hidden[:, -1]
 
+        v_value = self.critic_head(last_hidden).squeeze(-1)
+        raw_action = self.actor_head(last_hidden)
+        # 分割四个原始输出
+        mu_hue_raw, kappa_hue_raw, alpha_raw, beta_raw = torch.split(raw_action, 1, dim=-1)
+        # 应用激活函数确保参数有效
+        mu_hue = torch.tanh(mu_hue_raw) * math.pi  # 映射到 [-π, π]
+        kappa_hue = F.softplus(kappa_hue_raw) + 1e-6  # 确保 >0
+        alpha_val = F.softplus(alpha_raw) + 1e-6  # 确保 >0
+        beta_val = F.softplus(beta_raw) + 1e-6  # 确保 >0
+        hue_dist = VonMises(mu_hue.squeeze(-1), kappa_hue.squeeze(-1))
+        val_dist = Beta(alpha_val.squeeze(-1), beta_val.squeeze(-1))
+
         if action is None:
-            # Actor
-            raw = self.actor_head(last_hidden)
-            return torch.sigmoid(raw)
+            if deterministic:
+                # 确定性：取均值（注意hue的均值可能在圆上，直接使用）
+                hue_action = hue_dist.mean
+                val_action = val_dist.mean
+            else:
+                hue_action = hue_dist.sample()   # 采样
+                val_action = val_dist.sample()   # 采样
         else:
-            # Critic
-            act_emb = self.action_encoder(action)
-            combined = torch.cat([last_hidden, act_emb], dim=1)
-            q1 = self.critic_head1(combined)
-            q2 = self.critic_head2(combined)
-            return q1, q2
+            hue_action = action[...,0] * (2 * math.pi) - math.pi
+            val_action = action[...,1]
 
+        # 计算对数概率（分别计算后求和，假设独立）
+        log_prob_hue = hue_dist.log_prob(hue_action)
+        log_prob_val = val_dist.log_prob(val_action)
+        log_prob = log_prob_hue + log_prob_val
 
-   # ============================= 新增：并行轨迹推理 =============================
-    def forward_trajectory(self, batch_dict):
-        """
-        直接并行处理多条完整轨迹，输出每个时间步的动作及对应的双Q值。
+        # 手动计算von Mises分布的熵（PyTorch内置未实现）
+        kappa = hue_dist.concentration
+        kappa = torch.clamp(kappa, max=100)
+        i0 = torch.special.i0(kappa)
+        i1 = torch.special.i1(kappa)
+        ratio = i1 / i0
+        entropy_hue = torch.log(2 * math.pi * i0) - kappa * ratio
+        # Beta分布的熵直接可用
+        entropy_val = val_dist.entropy()
+        entropy = entropy_hue + entropy_val
 
-        参数 batch_dict 必须包含:
-            target_hue:      (B, 360)
-            target_value:    (B, 100)
-            all_positions:   (B, N, 2)
-            all_mask:        (B, N)          # bool，有效位置掩码
-            step_positions:  (B, T, 2)       # 每个时间步被调节的灯光位置
-            step_mixed_hue:  (B, T, 360)     # 每个时间步混合后的色相直方图
-            step_mixed_value:(B, T, 100)       # 每个时间步混合后的平均亮度
+        return v_value, ((hue_action + math.pi) % (2 * math.pi)) / (2 * math.pi), val_action, log_prob, entropy
 
-        返回:
-            dict {
-                'actions':      (B, T, 2)    归一化到 [-1,1] 的动作（可直接输入环境）
-                'actions_raw': (B, T, 2)    未归一化的 actor 原始输出
-                'q1':          (B, T)       第一个 critic 的 Q 值
-                'q2':          (B, T)       第二个 critic 的 Q 值
-            }
-        """
-        # ----- 1. 构建目标 token -----
-        B = batch_dict['target_hue'].shape[0]
-        device = next(self.parameters()).device
+    def discriminate(self, batch_dict, action):
 
-        # 全局位置编码（所有灯的固定布局）
-        global_pos = self.global_pos_encoder(
-            batch_dict['all_positions'],
-            batch_dict.get('all_mask', None)
-        )  # (B, d_model)
+        seq = self._build_sequence(batch_dict)
+        seq_len = seq.shape[1]
 
-        target_hue_emb = self.hue_encoder(batch_dict['target_hue'])   # (B, d_model)
-        target_value_emb = self.value_encoder(batch_dict['target_value']) # (B, d_model)
-        dummy_act_emb = self.dummy_act.unsqueeze(0).expand(B, -1)  # (B, d_model)
-        target_concat = torch.cat([global_pos, dummy_act_emb, target_hue_emb, target_value_emb], dim=-1)  # (B, d_model*4)
-        target_token = self.token_proj(target_concat).unsqueeze(1)   # (B, 1, d_model)
-
-        # ----- 2. 构建每个时间步的 token -----
-        T = batch_dict['step_positions'].size(1)
-
-        # 将 (B, T, ...) 合并为 (B*T, ...) 一次性编码
-        pos_flat = batch_dict['step_positions'].view(B * T, 2)               # (B*T, 2)
-        hue_flat = batch_dict['step_mixed_hue'].view(B * T, 360)            # (B*T, 360)
-        val_flat = batch_dict['step_mixed_value'].view(B * T, 100)            # (B*T, 100)
-
-        pos_emb = self.pos_encoder(pos_flat)            # (B*T, d_model)
-        hue_emb = self.hue_encoder(hue_flat)            # (B*T, d_model)
-        val_emb = self.value_encoder(val_flat)          # (B*T, d_model)
-        act_emb_flat = self.dummy_act.unsqueeze(0).expand(B * T, -1)  # (B*T, d_model)
-
-        step_concat = torch.cat([pos_emb, act_emb_flat, hue_emb, val_emb], dim=-1)   # (B*T, d_model*4)
-        step_token = self.token_proj(step_concat)                     # (B*T, d_model)
-        step_tokens = step_token.view(B, T, self.d_model)             # (B, T, d_model)
-
-        # ----- 3. 组合完整序列 -----
-        seq = torch.cat([target_token, step_tokens], dim=1)  # (B, 1+T, d_model)
-
-        # ----- 4. 添加位置编码与因果掩码 -----
-        seq_len = seq.size(1)
-        pos_emb = self.pos_embedding[:, :seq_len, :]        # (1, seq_len, d_model)
+        # positional embedding
+        pos_emb = self.pos_embedding[:, :seq_len, :]
         seq = seq + pos_emb
 
+        # causal mask
         causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float('-inf'), device=device),
+            torch.full((seq_len, seq_len), float('-inf'), device=seq.device),
             diagonal=1
         )
-        hidden = self.transformer(seq, mask=causal_mask)   # (B, seq_len, d_model)
 
-        # 取出每个时间步的隐状态（跳过目标token）
-        step_hidden = hidden[:, 1:, :]  # (B, T, d_model)
+        hidden = self.transformer(seq, mask=causal_mask)
+        last_hidden = hidden[:, -1]
 
-        # ----- 5. 预测动作及 Q 值 -----
-        # 原始 actor 输出（未归一化）
-        actions_raw = self.actor_head(step_hidden)        # (B, T, 2)
-        # 将动作归一化到 (0, 1)（与环境动作空间一致）
-        actions = torch.sigmoid(actions_raw)                 # (B, T, 2)
+        act_emb = self.action_encoder(action)
+        combined = torch.cat([last_hidden, act_emb], dim=1)
 
-        # 编码归一化后的动作，用于 critic
-        act_flat = actions.view(B * T, 2)                # (B*T, 2)
-        act_emb = self.action_encoder(act_flat)          # (B*T, d_model)
-        act_emb = act_emb.view(B, T, self.d_model)       # (B, T, d_model)
+        reward = self.reward_head(combined).squeeze(-1)
+        hue_dist = self.softmax(self.hue_head(combined))
+        value_dist = self.softmax(self.value_head(combined))
 
-        # 拼接隐状态与动作编码
-        combined = torch.cat([step_hidden, act_emb], dim=-1)  # (B, T, d_model*2)
-        combined_flat = combined.view(B * T, self.d_model * 2)
-
-        # 双 Q 值
-        q1_flat = self.critic_head1(combined_flat)       # (B*T, 1)
-        q2_flat = self.critic_head2(combined_flat)       # (B*T, 1)
-
-        q1 = q1_flat.view(B, T)                          # (B, T)
-        q2 = q2_flat.view(B, T)                          # (B, T)
-
-        return {
-            'actions': actions,          # 归一化动作，可直接用于环境
-            'actions_raw': actions_raw,  # 原始 actor logits
-            'q1': q1,
-            'q2': q2
-        }
-
-
-
+        return reward, hue_dist, value_dist
 
 
 # ============================= 测试代码 =============================
 if __name__ == "__main__":
-    torch.manual_seed(42)
-
-    # 1. 创建模型，并设置为训练模式（确保梯度计算）
     model = SeqLight(d_model=64, nhead=4, num_layers=3).cuda()
-    model.train()   # 显式启用 dropout / 梯度计算
-    print("[Info] Model created and set to train mode.")
+    model.train()   # 显式启用梯度计算
 
     # 参数量
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total trainable parameters: {total_params:,}")
 
-    B = 4
+    B = 4  # batch size
     t = 3  # 当前是第 3 步
 
     batch_dict = {
@@ -382,91 +341,10 @@ if __name__ == "__main__":
         't': t,
     }
 
-    # 测试 Actor
-    action = model(batch_dict)
-    print("Actor output shape:", action.shape)
+    # 测试
+    v_value, hue_action, val_action, log_prob, entropy = model(batch_dict, deterministic=False)
+    print(v_value.shape, hue_action.shape, val_action.shape, log_prob.shape, entropy.shape)
 
-    # 测试 Critic
-    fake_action = torch.rand(B, 2).cuda() * 2 - 1
-    q1, q2 = model(batch_dict, action=fake_action)
-    print(q1)
-    print("Critic Q1 shape:", q1.shape)
-    print("Critic Q2 shape:", q2.shape)
-
-
-    # 2. 构造一个 batch 的完整轨迹数据
-    B = 4          # batch size
-    T = 5          # 轨迹长度
-    N = 12         # 舞台上的灯光总数（固定）
-
-    batch_dict = {
-        'target_hue': torch.randn(B, 360).cuda(),
-        'target_value': torch.randn(B, 100).cuda(),
-        'all_positions': torch.rand(B, N, 2).cuda(),
-        'all_mask': torch.ones(B, N, dtype=torch.bool).cuda(),
-        'step_positions': torch.rand(B, T, 2).cuda(),
-        'step_mixed_hue': torch.randn(B, T, 360).cuda(),
-        'step_mixed_value': torch.randn(B, T, 100).cuda(),
-    }
-
-    # ------------------- 前向测试（不计算梯度，仅验证形状） -------------------
-    with torch.no_grad():
-        out_no_grad = model.forward_trajectory(batch_dict)
-        print("\n[Forward without grad]")
-        print(f"actions shape:      {out_no_grad['actions'].shape}")
-        print(f"actions_raw shape:  {out_no_grad['actions_raw'].shape}")
-        print(f"q1 shape:           {out_no_grad['q1'].shape}")
-        print(f"q2 shape:           {out_no_grad['q2'].shape}")
-        print(f"actions range:      [{out_no_grad['actions'].min():.3f}, {out_no_grad['actions'].max():.3f}]")
-
-    # ------------------- 反向传播测试（必须启用梯度） -------------------
-    out = model.forward_trajectory(batch_dict)   # 此时所有输出张量均 requires_grad=True
-    loss = (out['q1'].mean() + out['q2'].mean()) * 0.1 + out['actions'].pow(2).mean()
-    loss.backward()
-    print("\n[Backward]")
-    print(f"Loss value: {loss.item():.4f}")
-    # 检查第一个参数的梯度是否存在
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            print(f"  {name:30s} grad norm: {param.grad.norm().item():.4e}")
-            break
-
-    # ------------------- 与原始 forward 的一致性验证 -------------------
-    print("\n[Consistency Check with original forward]")
-    B1 = 2
-    batch_single = {
-        'target_hue': torch.randn(B1, 360).cuda(),
-        'target_value': torch.randn(B1, 100).cuda(),
-        'all_positions': torch.rand(B1, N, 2).cuda(),
-        'all_mask': torch.ones(B1, N, dtype=torch.bool).cuda(),
-        'step_positions': torch.rand(B1, 1, 2).cuda(),
-        'step_mixed_hue': torch.randn(B1, 1, 360).cuda(),
-        'step_mixed_value': torch.randn(B1, 1, 100).cuda(),
-    }
-    # 轨迹方式（不跟踪梯度以便比较）
-    with torch.no_grad():
-        out_traj = model.forward_trajectory(batch_single)
-        action_traj = out_traj['actions']
-        q1_traj = out_traj['q1']
-
-        # 原始单步方式
-        batch_original = {
-            'target_hue': batch_single['target_hue'],
-            'target_value': batch_single['target_value'],
-            'all_positions': batch_single['all_positions'],
-            'all_mask': batch_single['all_mask'],
-            'history_positions': torch.empty(B1, 0, 2).cuda(),
-            'history_actions': torch.empty(B1, 0, 2).cuda(),
-            'history_mixed_hue': torch.empty(B1, 0, 360).cuda(),
-            'history_mixed_value': torch.empty(B1, 0, 100).cuda(),
-            'current_position': batch_single['step_positions'],
-            'current_mixed_hue': batch_single['step_mixed_hue'],
-            'current_mixed_value': batch_single['step_mixed_value'],
-            't': 1,
-        }
-        action_original = model(batch_original)
-        q1_original, _ = model(batch_original, action=action_original)
-
-    print(f"Action difference:  {(action_traj.squeeze(1) - action_original).abs().max().item():.6f}")
-    print(f"Q1 difference:      {(q1_traj.squeeze(1) - q1_original.squeeze(1)).abs().max().item():.6f}")
-    print("[Consistency] Should be near zero (difference < 1e-5).")
+    action = torch.concat([hue_action.unsqueeze(-1),val_action.unsqueeze(-1)],dim=-1)
+    reward, hue_dist, value_dist = model.discriminate(batch_dict, action)
+    print(reward.shape, hue_dist.shape, value_dist.shape)
