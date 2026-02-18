@@ -153,8 +153,10 @@ def visualize_individual_and_mixed_lights(
         # hue_map_mixed 是 0~360，需要转成 HSV 图像
         hsv_mixed = np.zeros((h, w, 3))
         hsv_mixed[..., 0] = hue_map_mixed / 360.0
-        hsv_mixed[..., 1] = 0.9
-        hsv_mixed[..., 2] = np.clip(value_map_mixed / (value_map_mixed.max() + 1e-8), 0, 1)
+        # hsv_mixed[..., 1] = 0.9
+        hsv_mixed[..., 1] = 1.0
+        hsv_mixed[..., 2] = value_map_mixed
+        # hsv_mixed[..., 2] = np.clip(value_map_mixed / (value_map_mixed.max() + 1e-8), 0, 1)
 
         rgb_mixed = hsv_to_rgb(hsv_mixed)
         ax.imshow(rgb_mixed)
@@ -205,6 +207,7 @@ def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0, plot=
 
     for ep in range(num_episodes):
         # 重置环境（随机目标分布）
+        # state = env.reset(mode=mode,value_bias=10)
         state = env.reset(mode=mode)
         done = False
         while not done:
@@ -307,16 +310,16 @@ def main():
     parser.add_argument('--d_model', type=int, default=64)
     parser.add_argument('--nhead', type=int, default=4)
     parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--model_path', type=str, default="./bc_latest.pth", help='Path to trained model weights')
+    parser.add_argument('--model_path', type=str, default="./airl_latest.pth", help='Path to trained model weights')
 
     # 评估参数
     parser.add_argument('--num_episodes', type=int, default=5, help='Number of episodes to evaluate')
     parser.add_argument('--deterministic', action='store_true', default=True, help='Use deterministic actions (mean)')
     parser.add_argument('--t', type=float, default=0.1, help='Temperature')
-    parser.add_argument('--mode', type=int, default=None)
+    parser.add_argument('--mode', type=int, default=1)
 
     parser.add_argument('--plot', action='store_true', default=True, help='Plot distribution comparisons for each episode')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--seed', type=int, default=420, help='Random seed for reproducibility')
     parser.add_argument('--no_cuda', action='store_true', default=False, help='Disable CUDA')
 
     args = parser.parse_args()

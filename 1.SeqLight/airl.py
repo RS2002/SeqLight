@@ -654,7 +654,7 @@ if __name__ == "__main__":
     parser.add_argument('--d_model', type=int, default=64)
     parser.add_argument('--nhead', type=int, default=4)
     parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--pretrained_path', type=str, default='bc_best.pth')
+    parser.add_argument('--pretrained_path', type=str, default='bc_latest.pth')
 
     # 训练参数
     parser.add_argument('--iterations', type=int, default=200)
@@ -663,7 +663,7 @@ if __name__ == "__main__":
     parser.add_argument('--disc_updates', type=int, default=5)
     parser.add_argument('--policy_updates', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--aux_weight', type=float, default=0.1)
     parser.add_argument('--clip_epsilon', type=float, default=0.2)
     parser.add_argument('--value_coef', type=float, default=0.5)
@@ -687,7 +687,7 @@ if __name__ == "__main__":
                         help='Learning rate scheduler type')
     parser.add_argument('--lr_step_size', type=int, default=50, help='StepLR step size')
     parser.add_argument('--lr_gamma', type=float, default=0.5, help='StepLR gamma')
-    parser.add_argument('--lr_min', type=float, default=1e-5, help='Minimum LR for cosine annealing')
+    parser.add_argument('--lr_min', type=float, default=5e-6, help='Minimum LR for cosine annealing')
 
     # 保存与日志
     parser.add_argument('--best_save_path', type=str, default='airl_best.pth')

@@ -19,7 +19,7 @@ class LightingEnv:
         max_n_peaks=3,
         max_hue_similarity=3,
         value_range=(0, 1),
-        default_value_bias=None,  # 新增：默认值采样偏向性，1.0=均匀，>1 偏向低值
+        default_value_bias=5.0,  # 新增：默认值采样偏向性，1.0=均匀，>1 偏向低值
     ):
         self.grid_h, self.grid_w = grid_size
         self.decay_model = decay_model
@@ -355,7 +355,7 @@ class LightingEnv:
             # value_bias = self.default_value_bias
             # value_bias = 1.0
             # value_bias = random.uniform(0.2, 5.0)
-            value_bias = random.uniform(1.0, 5.0)
+            value_bias = random.uniform(1.0, self.default_value_bias)
 
         if value_bias == 1.0:
             # 均匀采样
@@ -580,9 +580,9 @@ if __name__ == '__main__':
     # print(state)
     print("target_value mean bin (approx):", np.sum(np.arange(100) * state['target_value']) / 100)
 
-    # 测试 reset_expert 产生极低亮度目标（value_range=(0,0.3) 且 value_bias=10）
-    print("\n=== reset_expert with very low brightness (range=(0,0.3), bias=10) ===")
-    state = env.reset_expert(N=8, hue_similarity=3, value_range=(0, 0.3), value_bias=10.0)
+    # 测试 reset_expert 产生极低亮度目标（value_range=(0,0.3) 且 value_bias=2）
+    print("\n=== reset_expert with very low brightness (range=(0,0.3), bias=2) ===")
+    state = env.reset_expert(N=8, hue_similarity=3, value_range=(0, 0.3), value_bias=2.0)
     # print(state)
     print("target_value mean bin (approx):", np.sum(np.arange(100) * state['target_value']) / 100)
 

@@ -564,7 +564,7 @@ if __name__ == "__main__":
     parser.add_argument('--policy_steps_per_iter', type=int, default=1500, help='Steps collected per iteration')
     parser.add_argument('--policy_updates', type=int, default=10, help='Number of PPO updates per iteration')
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate for actor/critic')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for actor/critic')
     parser.add_argument('--clip_epsilon', type=float, default=0.2)
     parser.add_argument('--value_coef', type=float, default=0.5)
     parser.add_argument('--entropy_coef', type=float, default=0.01)
@@ -587,7 +587,7 @@ if __name__ == "__main__":
                         help='Learning rate scheduler type')
     parser.add_argument('--lr_step_size', type=int, default=50, help='StepLR step size')
     parser.add_argument('--lr_gamma', type=float, default=0.5, help='StepLR gamma')
-    parser.add_argument('--lr_min', type=float, default=1e-5, help='Minimum LR for cosine annealing')
+    parser.add_argument('--lr_min', type=float, default=5e-6, help='Minimum LR for cosine annealing')
 
     # 保存与日志
     parser.add_argument('--best_save_path', type=str, default='ppo_best.pth')

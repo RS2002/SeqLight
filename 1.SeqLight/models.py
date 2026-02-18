@@ -254,6 +254,8 @@ class SeqLight(nn.Module):
         alpha_val = F.softplus(alpha_raw) + 1e-6  # 确保 >0
         beta_val = F.softplus(beta_raw) + 1e-6  # 确保 >0
 
+        # print(f"Alpha: {alpha_val.mean().item():.4f}, Beta: {beta_val.mean().item():.4f}")
+
         if t == 1:
             hue_dist = VonMises(mu_hue.squeeze(-1), kappa_hue.squeeze(-1))
             val_dist = Beta(alpha_val.squeeze(-1), beta_val.squeeze(-1))
