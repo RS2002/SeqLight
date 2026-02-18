@@ -8,6 +8,7 @@ from env import LightingEnv
 from models import SeqLight
 from light_mix import compute_mixed_lighting
 
+
 # ------------------------------ 已有的距离度量函数 ------------------------------
 def circular_l1_distance(p, q, bins=360):
     p = np.asarray(p, dtype=np.float64)
@@ -193,7 +194,7 @@ def visualize_target_as_color_block(target_hue, target_value, figsize=(3,3)):
     plt.show()
 
 # ------------------------------ 评估主函数 ------------------------------
-def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0, plot=False):
+def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0, plot=False, mode = None):
     """
     在环境中运行策略，评估目标分布与最终分布的差异。
     返回每个episode的hue距离、value距离列表。
@@ -204,7 +205,7 @@ def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0, plot=
 
     for ep in range(num_episodes):
         # 重置环境（随机目标分布）
-        state = env.reset(mode=1)
+        state = env.reset(mode=mode)
         done = False
         while not done:
             # 构建批处理字典（增加batch维度）
@@ -252,29 +253,40 @@ def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0, plot=
             axes[1].set_xlabel('Value bin')
             axes[1].set_ylabel('Probability')
             axes[1].legend()
-
             plt.tight_layout()
             plt.show()
 
             # 显示目标色块
             visualize_target_as_color_block(target_hue, target_value)
 
+            # 显示 ground truth 灯光效果（如果存在）
+            if hasattr(env, 'ground_truth_hues') and env.ground_truth_hues is not None:
+                visualize_individual_and_mixed_lights(
+                    positions=env.positions_raw,
+                    hues=env.ground_truth_hues,
+                    values=env.ground_truth_values,
+                    grid_size=(env.grid_h, env.grid_w),
+                    decay_model=env.decay_model,
+                    sigma=env.sigma,
+                    ncols=3,
+                    show_mixed_hue=True,
+                    title_prefix=f"Episode {ep + 1} Ground Truth - "
+                )
+
             # 显示策略生成的灯光效果
-            # 从环境中获取最终灯光参数
-            final_positions = env.positions_raw
-            final_hues = env.hues
-            final_values = env.values
             visualize_individual_and_mixed_lights(
-                positions=final_positions,
-                hues=final_hues,
-                values=final_values,
+                positions=env.positions_raw,
+                hues=env.hues,
+                values=env.values,
                 grid_size=(env.grid_h, env.grid_w),
                 decay_model=env.decay_model,
                 sigma=env.sigma,
                 ncols=3,
                 show_mixed_hue=True,
-                title_prefix=f"Episode {ep+1} - "
+                title_prefix=f"Episode {ep + 1} Policy - "
             )
+
+
 
     avg_hue = np.mean(hue_dists)
     avg_value = np.mean(value_dists)
@@ -295,15 +307,16 @@ def main():
     parser.add_argument('--d_model', type=int, default=64)
     parser.add_argument('--nhead', type=int, default=4)
     parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--model_path', type=str, default="./airl_latest.pth", help='Path to trained model weights')
+    parser.add_argument('--model_path', type=str, default="./bc_latest.pth", help='Path to trained model weights')
 
     # 评估参数
     parser.add_argument('--num_episodes', type=int, default=5, help='Number of episodes to evaluate')
     parser.add_argument('--deterministic', action='store_true', default=True, help='Use deterministic actions (mean)')
     parser.add_argument('--t', type=float, default=0.1, help='Temperature')
+    parser.add_argument('--mode', type=int, default=None)
 
     parser.add_argument('--plot', action='store_true', default=True, help='Plot distribution comparisons for each episode')
-    parser.add_argument('--seed', type=int, default=1, help='Random seed for reproducibility')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--no_cuda', action='store_true', default=False, help='Disable CUDA')
 
     args = parser.parse_args()
@@ -333,7 +346,7 @@ def main():
     print(f"Model loaded from {args.model_path}")
 
     # 评估
-    evaluate(env, policy, args.num_episodes, device, deterministic=args.deterministic, plot=args.plot, t=args.t)
+    evaluate(env, policy, args.num_episodes, device, deterministic=args.deterministic, plot=args.plot, t=args.t, mode=args.mode)
 
 if __name__ == "__main__":
     main()

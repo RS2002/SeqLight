@@ -3,6 +3,7 @@ import argparse
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 import torch.nn.functional as F
 from datetime import datetime
 from torch.utils.data import Dataset, DataLoader
@@ -16,7 +17,6 @@ class DynamicExpertDataset:
     """
     每个 epoch 重新生成一批轨迹，并提供 DataLoader
     """
-
     def __init__(self, env, num_trajectories_per_epoch, min_lights, max_lights,
                  hue_similarity_range=(1, 3)):
         self.env = env
@@ -73,7 +73,7 @@ def train_bc(args):
     with open(log_file, 'w') as f:
         f.write(f"BC Training Log - Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Arguments: {args}\n")
-        f.write("Epoch\tBC Loss\tAux Loss\tTotal Loss\tBest So Far\n")
+        f.write("Epoch\tBC Loss\tAux Loss\tTotal Loss\tBest So Far\tLR\n")
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
@@ -91,7 +91,6 @@ def train_bc(args):
         env.seed(args.seed)
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
-    # 可选：记录种子信息
 
     dataset = DynamicExpertDataset(
         env,
@@ -110,6 +109,14 @@ def train_bc(args):
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
+    # 学习率调度器
+    if args.lr_scheduler == 'step':
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
+    elif args.lr_scheduler == 'cosine':
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr_min)
+    else:
+        scheduler = None
+
     best_loss = float('inf')
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}: generating new expert data...")
@@ -118,6 +125,7 @@ def train_bc(args):
         epoch_loss_bc = 0.0
         epoch_loss_aux = 0.0
         num_batches = 0
+        skipped_batches = 0
 
         for t in range(1, args.max_lights + 1):
             samples = samples_by_t[t]
@@ -139,40 +147,74 @@ def train_bc(args):
                 batch_next_hue = batch_next_hue.to(device)
                 batch_next_value = batch_next_value.to(device)
 
-                # 前向：获得动作的对数概率和判别器输出
-                _, _, _, log_prob, _ = model(batched_state, action=batch_actions)
-                _, pred_hue, pred_value = model.discriminate(batched_state, batch_actions)
+                # 检查输入是否包含 NaN
+                if torch.isnan(batch_actions).any():
+                    print("Warning: batch_actions contains NaN, skipping this batch")
+                    skipped_batches += 1
+                    continue
+                nan_in_state = False
+                for k, v in batched_state.items():
+                    if isinstance(v, torch.Tensor) and torch.isnan(v).any():
+                        print(f"Warning: {k} contains NaN, skipping this batch")
+                        nan_in_state = True
+                        break
+                if nan_in_state:
+                    skipped_batches += 1
+                    continue
 
-                # BC 损失：负对数似然
-                loss_bc = -log_prob.mean()
+                try:
+                    # 前向：获得动作的对数概率和判别器输出
+                    _, _, _, log_prob, _ = model(batched_state, action=batch_actions)
+                    _, pred_hue, pred_value = model.discriminate(batched_state, batch_actions)
 
-                # 辅助预测损失：交叉熵
-                loss_aux_hue = -(batch_next_hue * torch.log(pred_hue + 1e-8)).sum(dim=-1).mean()
-                loss_aux_value = -(batch_next_value * torch.log(pred_value + 1e-8)).sum(dim=-1).mean()
-                loss_aux = loss_aux_hue + loss_aux_value
+                    # BC 损失：负对数似然
+                    loss_bc = -log_prob.mean()
 
-                # 总损失
-                loss = loss_bc + args.aux_weight * loss_aux
+                    # 辅助预测损失：交叉熵
+                    loss_aux_hue = -(batch_next_hue * torch.log(pred_hue + 1e-8)).sum(dim=-1).mean()
+                    loss_aux_value = -(batch_next_value * torch.log(pred_value + 1e-8)).sum(dim=-1).mean()
+                    loss_aux = loss_aux_hue + loss_aux_value
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
+                    # 总损失
+                    loss = loss_bc + args.aux_weight * loss_aux
 
-                epoch_loss_bc += loss_bc.item()
-                epoch_loss_aux += loss_aux.item()
-                num_batches += 1
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
 
-        avg_loss_bc = epoch_loss_bc / num_batches if num_batches > 0 else 0.0
-        avg_loss_aux = epoch_loss_aux / num_batches if num_batches > 0 else 0.0
+                    epoch_loss_bc += loss_bc.item()
+                    epoch_loss_aux += loss_aux.item()
+                    num_batches += 1
+
+                except ValueError as e:
+                    print(f"ValueError in forward pass: {e}")
+                    print("Skipping this batch due to numerical error.")
+                    # 打印调试信息
+                    print("batch_actions stats:", batch_actions.min().item(), batch_actions.max().item(), batch_actions.mean().item())
+                    for k, v in batched_state.items():
+                        if isinstance(v, torch.Tensor):
+                            print(f"{k}: min={v.min().item():.3f}, max={v.max().item():.3f}, mean={v.mean().item():.3f}, any_nan={torch.isnan(v).any()}")
+                    skipped_batches += 1
+                    continue
+
+        if num_batches == 0:
+            print(f"Warning: No valid batches in epoch {epoch+1}, all skipped.")
+            continue
+
+        avg_loss_bc = epoch_loss_bc / num_batches
+        avg_loss_aux = epoch_loss_aux / num_batches
         avg_total = avg_loss_bc + args.aux_weight * avg_loss_aux
 
         best_so_far = "Yes" if avg_total < best_loss else "No"
-        print(f"  BC Loss: {avg_loss_bc:.4f} | Aux Loss: {avg_loss_aux:.4f} | Total: {avg_total:.4f}")
+
+        # 获取当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"  BC Loss: {avg_loss_bc:.4f} | Aux Loss: {avg_loss_aux:.4f} | Total: {avg_total:.4f} | LR: {current_lr:.6f} | Skipped: {skipped_batches}")
 
         # 写入日志
         with open(log_file, 'a') as f:
-            f.write(f"{epoch + 1}\t{avg_loss_bc:.6f}\t{avg_loss_aux:.6f}\t{avg_total:.6f}\t{best_so_far}\n")
+            f.write(f"{epoch + 1}\t{avg_loss_bc:.6f}\t{avg_loss_aux:.6f}\t{avg_total:.6f}\t{best_so_far}\t{current_lr:.6f}\n")
 
         # 保存最新模型（覆盖）
         torch.save(model.state_dict(), args.latest_save_path)
@@ -183,6 +225,10 @@ def train_bc(args):
             torch.save(model.state_dict(), args.best_save_path)
             print(f"  New best model saved to {args.best_save_path}")
 
+        # 学习率调度器步进
+        if scheduler is not None:
+            scheduler.step()
+
     print("BC training finished.")
     with open(log_file, 'a') as f:
         f.write(f"Training finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -190,7 +236,7 @@ def train_bc(args):
 
 # ------------------------------ 主程序 ------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Enhanced BC with auxiliary prediction")
+    parser = argparse.ArgumentParser(description="Enhanced BC with auxiliary prediction and scheduler")
     # 环境参数
     parser.add_argument('--min_lights', type=int, default=8)
     parser.add_argument('--max_lights', type=int, default=8)
@@ -208,7 +254,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=3)
 
     # 训练超参数
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
@@ -216,6 +262,13 @@ if __name__ == "__main__":
                         help='Weight for auxiliary prediction loss')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--no_cuda', action='store_true')
+
+    # 学习率调度器
+    parser.add_argument('--lr_scheduler', type=str, default='step', choices=['none', 'step', 'cosine'],
+                        help='Learning rate scheduler type')
+    parser.add_argument('--lr_step_size', type=int, default=50, help='StepLR step size')
+    parser.add_argument('--lr_gamma', type=float, default=0.5, help='StepLR gamma')
+    parser.add_argument('--lr_min', type=float, default=1e-5, help='Minimum LR for cosine annealing')
 
     # 保存路径
     parser.add_argument('--best_save_path', type=str, default='bc_best.pth')
