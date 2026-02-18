@@ -193,7 +193,7 @@ def visualize_target_as_color_block(target_hue, target_value, figsize=(3,3)):
     plt.show()
 
 # ------------------------------ 评估主函数 ------------------------------
-def evaluate(env, policy, num_episodes, device, deterministic=True, plot=False):
+def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0, plot=False):
     """
     在环境中运行策略，评估目标分布与最终分布的差异。
     返回每个episode的hue距离、value距离列表。
@@ -216,7 +216,7 @@ def evaluate(env, policy, num_episodes, device, deterministic=True, plot=False):
                     state_tensor[k] = torch.tensor([v]).to(device)
 
             with torch.no_grad():
-                _, hue_action, val_action, _, _ = policy(state_tensor, deterministic=deterministic)
+                _, hue_action, val_action, _, _ = policy(state_tensor, deterministic=deterministic, t=t)
                 action = np.array([hue_action.cpu().numpy()[0], val_action.cpu().numpy()[0]])
 
             next_state, _, done, info = env.step(action)
@@ -298,10 +298,12 @@ def main():
     parser.add_argument('--model_path', type=str, default="./airl_latest.pth", help='Path to trained model weights')
 
     # 评估参数
-    parser.add_argument('--num_episodes', type=int, default=3, help='Number of episodes to evaluate')
+    parser.add_argument('--num_episodes', type=int, default=5, help='Number of episodes to evaluate')
     parser.add_argument('--deterministic', action='store_true', default=True, help='Use deterministic actions (mean)')
+    parser.add_argument('--t', type=float, default=0.1, help='Temperature')
+
     parser.add_argument('--plot', action='store_true', default=True, help='Plot distribution comparisons for each episode')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--seed', type=int, default=1, help='Random seed for reproducibility')
     parser.add_argument('--no_cuda', action='store_true', default=False, help='Disable CUDA')
 
     args = parser.parse_args()
@@ -331,7 +333,7 @@ def main():
     print(f"Model loaded from {args.model_path}")
 
     # 评估
-    evaluate(env, policy, args.num_episodes, device, deterministic=args.deterministic, plot=args.plot)
+    evaluate(env, policy, args.num_episodes, device, deterministic=args.deterministic, plot=args.plot, t=args.t)
 
 if __name__ == "__main__":
     main()

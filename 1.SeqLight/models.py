@@ -227,7 +227,7 @@ class SeqLight(nn.Module):
 
         return seq
 
-    def forward(self, batch_dict, action=None, deterministic=False):
+    def forward(self, batch_dict, action=None, deterministic=False, t=1.0):
         seq = self._build_sequence(batch_dict)
         seq_len = seq.shape[1]
 
@@ -253,8 +253,19 @@ class SeqLight(nn.Module):
         kappa_hue = F.softplus(kappa_hue_raw) + 1e-6  # 确保 >0
         alpha_val = F.softplus(alpha_raw) + 1e-6  # 确保 >0
         beta_val = F.softplus(beta_raw) + 1e-6  # 确保 >0
-        hue_dist = VonMises(mu_hue.squeeze(-1), kappa_hue.squeeze(-1))
-        val_dist = Beta(alpha_val.squeeze(-1), beta_val.squeeze(-1))
+
+        if t == 1:
+            hue_dist = VonMises(mu_hue.squeeze(-1), kappa_hue.squeeze(-1))
+            val_dist = Beta(alpha_val.squeeze(-1), beta_val.squeeze(-1))
+        else:
+            hue_dist = VonMises(mu_hue.squeeze(-1), kappa_hue.squeeze(-1)/t)
+            eps = 1e-6
+            alpha_temp = (alpha_val - 1) / t + 1
+            beta_temp = (beta_val - 1) / t + 1
+            alpha_temp = torch.clamp(alpha_temp, min=eps)
+            beta_temp = torch.clamp(beta_temp, min=eps)
+            val_dist = Beta(alpha_temp.squeeze(-1), beta_temp.squeeze(-1))
+
 
         if action is None:
             if deterministic:

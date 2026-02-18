@@ -3,9 +3,11 @@ import argparse
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 import torch.nn.functional as F
 from datetime import datetime
-from collections import namedtuple
+from collections import namedtuple, deque
+import copy
 from env import LightingEnv
 from models import SeqLight
 from light_mix import compute_mixed_lighting
@@ -34,6 +36,37 @@ class RolloutBuffer:
 
     def get_all(self):
         return self.buffer
+
+# HER样本数据结构：包含状态、动作以及该动作后的实际分布（与目标无关）
+class HERSample:
+    def __init__(self, state, action, next_hue, next_value):
+        self.state = state
+        self.action = action
+        self.next_hue = next_hue
+        self.next_value = next_value
+
+def collate_her_samples(batch):
+    """合并HER样本列表，返回 (states, actions, next_hues, next_values) 的批处理字典"""
+    states = [item.state for item in batch]
+    actions = np.stack([item.action for item in batch])
+    next_hues = np.stack([item.next_hue for item in batch])
+    next_values = np.stack([item.next_value for item in batch])
+    # 构造状态字典
+    batched = {}
+    keys = states[0].keys()
+    for k in keys:
+        if k == 't':
+            batched[k] = torch.tensor([s[k] for s in states], dtype=torch.long)
+        elif isinstance(states[0][k], np.ndarray):
+            arr = np.stack([s[k] for s in states])
+            if k == 'all_mask':
+                batched[k] = torch.from_numpy(arr).bool()
+            else:
+                batched[k] = torch.from_numpy(arr).float()
+        else:
+            batched[k] = torch.tensor([s[k] for s in states])
+    return batched, torch.from_numpy(actions).float(), \
+           torch.from_numpy(next_hues).float(), torch.from_numpy(next_values).float()
 
 # ------------------------------ 动态专家数据集 ------------------------------
 class DynamicExpertDataset:
@@ -64,6 +97,7 @@ class DynamicExpertDataset:
 
 # ------------------------------ 批处理函数 ------------------------------
 def collate_states_with_next(batch):
+    """合并 (state, action, next_hue, next_value) 列表，用于专家或策略数据"""
     states = [item[0] for item in batch]
     actions = np.stack([item[1] for item in batch])
     next_hues = np.stack([item[2] if item[2] is not None else np.zeros(360) for item in batch])
@@ -86,6 +120,7 @@ def collate_states_with_next(batch):
            torch.from_numpy(next_hues).float(), torch.from_numpy(next_values).float()
 
 def collate_policy_trajectory(batch):
+    """合并 Transition 列表用于 PPO 更新"""
     states = [t.state for t in batch]
     actions = np.stack([t.action for t in batch])
     rewards = np.stack([t.reward for t in batch])
@@ -182,6 +217,43 @@ def collect_trajectories(env, policy, num_steps, device, deterministic=False):
         steps += 1
 
     return buffer
+
+# ------------------------------ 从缓冲区提取完整轨迹 ------------------------------
+def extract_trajectories(buffer):
+    """将缓冲区中的transition按done分割成完整轨迹列表，每条轨迹是一个Transition列表"""
+    transitions = buffer.get_all()
+    trajectories = []
+    current_traj = []
+    for t in transitions:
+        current_traj.append(t)
+        if t.done:
+            trajectories.append(current_traj)
+            current_traj = []
+    if current_traj:
+        # 如果最后一条轨迹未完成，丢弃（因为无法获取最终分布）
+        pass
+    return trajectories
+
+# ------------------------------ 生成HER样本 ------------------------------
+def generate_her_samples(trajectories):
+    """
+    从完整轨迹列表生成HER样本。
+    对每条轨迹，用最终分布的next_hue/next_value替换每个transition的状态目标，生成 (new_state, action, next_hue, next_value) 样本。
+    其中 next_hue/next_value 是原始轨迹中该动作后的实际分布（保持不变）。
+    返回 HERSample 列表。
+    """
+    her_samples = []
+    for traj in trajectories:
+        # 最终分布
+        final_hue = traj[-1].next_hue
+        final_value = traj[-1].next_value
+        for t in traj:
+            # 深拷贝状态
+            new_state = copy.deepcopy(t.state)
+            new_state['target_hue'] = final_hue
+            new_state['target_value'] = final_value
+            her_samples.append(HERSample(new_state, t.action, t.next_hue, t.next_value))
+    return her_samples
 
 # ------------------------------ 判别器奖励计算 ------------------------------
 def compute_discriminator_rewards(buffer, policy, device, batch_size=64):
@@ -288,7 +360,7 @@ def evaluate_policy(env, policy, device, num_episodes=5):
     hue_dists = []
     value_dists = []
     for _ in range(num_episodes):
-        state = env.reset(mode=1)
+        state = env.reset(mode=1,n=3)
         done = False
         while not done:
             state_tensor = {}
@@ -367,6 +439,14 @@ def train_airl(args):
 
     optimizer = optim.Adam(policy.parameters(), lr=args.lr)
 
+    # 学习率调度器
+    if args.lr_scheduler == 'step':
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
+    elif args.lr_scheduler == 'cosine':
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iterations, eta_min=args.lr_min)
+    else:
+        scheduler = None
+
     expert_dataset = DynamicExpertDataset(
         env,
         num_trajectories_per_iter=args.expert_trajs_per_iter,
@@ -387,20 +467,59 @@ def train_airl(args):
         print("  Collecting policy trajectories...")
         rollout_buffer = collect_trajectories(env, policy, args.policy_steps_per_iter, device)
 
-        # 3. 计算判别器奖励
+        # 3. 如果启用HER，从策略轨迹中提取完整轨迹并生成HER样本
+        her_samples = []
+        if args.use_her:
+            trajectories = extract_trajectories(rollout_buffer)
+            her_samples = generate_her_samples(trajectories)
+            print(f"    Generated {len(her_samples)} HER samples")
+
+        # 4. 计算判别器奖励（基于原始目标，用于PPO）
         rollout_buffer = compute_discriminator_rewards(rollout_buffer, policy, device, batch_size=args.batch_size)
 
-        # 4. 训练判别器
+        # 5. 训练判别器
         disc_loss_total = 0.0
         for _ in range(args.disc_updates):
+            # 从真实专家数据中采样
             expert_batch = expert_dataset.sample(args.batch_size)
+
+            # 从策略轨迹中采样（作为负样本）
             policy_transitions = rollout_buffer.sample(args.batch_size)
             policy_batch = collate_states_with_next(
                 [(t.state, t.action, t.next_hue, t.next_value) for t in policy_transitions]
             )
 
-            # 专家数据
-            batch_states_e, batch_actions_e, batch_next_hue_e, batch_next_value_e = expert_batch
+            # 如果启用HER并用于判别器，则从HER样本中采样作为正样本的一部分
+            # HER样本也有真实的下一步分布，可以直接与专家合并
+            if args.use_her and args.her_in_expert and len(her_samples) > 0:
+                her_batch_size = int(args.batch_size * args.her_ratio)
+                if her_batch_size > 0:
+                    # 从HER样本中采样
+                    her_indices = np.random.choice(len(her_samples), her_batch_size, replace=False)
+                    her_batch = [her_samples[i] for i in her_indices]
+                    her_states, her_actions, her_next_hue, her_next_value = collate_her_samples(her_batch)
+
+                    # 从真实专家中采样剩余数量
+                    expert_batch_real = expert_dataset.sample(args.batch_size - her_batch_size)
+
+                    # 合并HER和真实专家
+                    batch_states_e = {}
+                    for k in expert_batch_real[0].keys():
+                        if k == 't':
+                            batch_states_e[k] = torch.cat([expert_batch_real[0][k], her_states[k]], dim=0)
+                        elif isinstance(expert_batch_real[0][k], torch.Tensor):
+                            batch_states_e[k] = torch.cat([expert_batch_real[0][k], her_states[k]], dim=0)
+                    batch_actions_e = torch.cat([expert_batch_real[1], her_actions], dim=0)
+                    batch_next_hue_e = torch.cat([expert_batch_real[2], her_next_hue], dim=0)
+                    batch_next_value_e = torch.cat([expert_batch_real[3], her_next_value], dim=0)
+                else:
+                    # her_batch_size为0，退化为纯专家
+                    batch_states_e, batch_actions_e, batch_next_hue_e, batch_next_value_e = expert_batch
+            else:
+                # 不使用HER，直接使用专家
+                batch_states_e, batch_actions_e, batch_next_hue_e, batch_next_value_e = expert_batch
+
+            # 将专家数据（可能包含HER）移到设备
             for k in batch_states_e:
                 if isinstance(batch_states_e[k], torch.Tensor):
                     batch_states_e[k] = batch_states_e[k].to(device)
@@ -427,6 +546,7 @@ def train_airl(args):
                 torch.cat([labels_e, labels_p])
             )
 
+            # AUX loss：所有样本（包括HER）都有真实的下一步分布，统一计算
             loss_aux_e = -(batch_next_hue_e * torch.log(pred_hue_e + 1e-8)).sum(dim=-1).mean() \
                          - (batch_next_value_e * torch.log(pred_value_e + 1e-8)).sum(dim=-1).mean()
             loss_aux_p = -(batch_next_hue_p * torch.log(pred_hue_p + 1e-8)).sum(dim=-1).mean() \
@@ -444,7 +564,7 @@ def train_airl(args):
 
         avg_disc_loss = disc_loss_total / args.disc_updates
 
-        # 5. 训练策略（PPO），可选择加入 BC loss
+        # 6. 训练策略（PPO），可选择加入 BC loss 和 HER BC loss
         policy_loss_total = 0.0
         transitions = rollout_buffer.get_all()
         for _ in range(args.policy_updates):
@@ -453,19 +573,34 @@ def train_airl(args):
             batch = [transitions[i] for i in indices]
             batched = collate_policy_trajectory(batch)
 
-            # 如果需要 BC loss，则从专家数据集中采样一个 batch 并计算 BC loss
+            # 计算BC loss：可能来自真实专家和/或HER
+            bc_loss_val = None
             if args.use_bc_loss:
-                bc_batch = expert_dataset.sample(args.batch_size)
-                bc_states, bc_actions, _, _ = bc_batch
-                for k in bc_states:
-                    if isinstance(bc_states[k], torch.Tensor):
-                        bc_states[k] = bc_states[k].to(device)
-                bc_actions = bc_actions.to(device)
-                # 计算 BC loss：负对数似然
-                _, _, _, bc_log_prob, _ = policy(bc_states, action=bc_actions)
-                bc_loss_val = -bc_log_prob.mean()
-            else:
-                bc_loss_val = None
+                # 从真实专家采样
+                bc_expert_batch = expert_dataset.sample(args.batch_size)
+                bc_states_e, bc_actions_e, _, _ = bc_expert_batch
+                for k in bc_states_e:
+                    if isinstance(bc_states_e[k], torch.Tensor):
+                        bc_states_e[k] = bc_states_e[k].to(device)
+                bc_actions_e = bc_actions_e.to(device)
+                _, _, _, bc_log_prob_e, _ = policy(bc_states_e, action=bc_actions_e)
+                bc_loss_e = -bc_log_prob_e.mean()
+
+                # 如果启用HER BC，则同时从HER采样并计算BC loss
+                if args.use_her and args.her_in_bc and len(her_samples) > 0:
+                    her_indices = np.random.choice(len(her_samples), args.batch_size, replace=False)
+                    her_batch = [her_samples[i] for i in her_indices]
+                    her_states, her_actions, _, _ = collate_her_samples(her_batch)  # 只需要状态和动作
+                    for k in her_states:
+                        if isinstance(her_states[k], torch.Tensor):
+                            her_states[k] = her_states[k].to(device)
+                    her_actions = her_actions.to(device)
+                    _, _, _, bc_log_prob_h, _ = policy(her_states, action=her_actions)
+                    bc_loss_h = -bc_log_prob_h.mean()
+                    # 合并两个BC loss，可以加权平均
+                    bc_loss_val = (bc_loss_e + bc_loss_h) / 2
+                else:
+                    bc_loss_val = bc_loss_e
 
             loss = ppo_update(policy, optimizer, batched,
                               args.clip_epsilon, args.value_coef, args.entropy_coef,
@@ -475,7 +610,7 @@ def train_airl(args):
 
         avg_policy_loss = policy_loss_total / args.policy_updates
 
-        # 6. 评估
+        # 7. 评估
         avg_hue_l1, avg_value_l1 = evaluate_policy(env, policy, device, num_episodes=5)
 
         avg_reward = np.mean([t.reward for t in transitions])
@@ -495,13 +630,19 @@ def train_airl(args):
             torch.save(policy.state_dict(), args.best_save_path)
             print(f"  New best model saved to {args.best_save_path}")
 
+        # 学习率调度器步进
+        if scheduler is not None:
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"  Current LR: {current_lr:.6f}")
+
     print("AIRL training finished.")
     with open(log_file, 'a') as f:
         f.write(f"Training finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
 # ------------------------------ 主程序入口 ------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AIRL + PPO for Lighting Control")
+    parser = argparse.ArgumentParser(description="AIRL + PPO for Lighting Control with HER")
     # 环境参数
     parser.add_argument('--min_lights', type=int, default=8)
     parser.add_argument('--max_lights', type=int, default=8)
@@ -534,6 +675,19 @@ if __name__ == "__main__":
     # BC loss 选项
     parser.add_argument('--use_bc_loss', action='store_true', help='Whether to add BC loss during policy update')
     parser.add_argument('--bc_coef', type=float, default=0.1, help='Coefficient for BC loss')
+
+    # HER 选项
+    parser.add_argument('--use_her', action='store_true', help='Enable Hindsight Experience Replay')
+    parser.add_argument('--her_in_expert', action='store_true', help='Use HER samples as expert data for discriminator')
+    parser.add_argument('--her_in_bc', action='store_true', help='Use HER samples for BC loss')
+    parser.add_argument('--her_ratio', type=float, default=0.2, help='Proportion of HER samples in expert batch (if used)')
+
+    # 学习率调度器
+    parser.add_argument('--lr_scheduler', type=str, default='step', choices=['none', 'step', 'cosine'],
+                        help='Learning rate scheduler type')
+    parser.add_argument('--lr_step_size', type=int, default=50, help='StepLR step size')
+    parser.add_argument('--lr_gamma', type=float, default=0.5, help='StepLR gamma')
+    parser.add_argument('--lr_min', type=float, default=1e-5, help='Minimum LR for cosine annealing')
 
     # 保存与日志
     parser.add_argument('--best_save_path', type=str, default='airl_best.pth')

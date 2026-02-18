@@ -3,9 +3,11 @@ import argparse
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 import torch.nn.functional as F
 from datetime import datetime
 from collections import namedtuple
+import copy
 from env import LightingEnv
 from models import SeqLight
 from light_mix import compute_mixed_lighting
@@ -35,7 +37,33 @@ class RolloutBuffer:
     def get_all(self):
         return self.buffer
 
-# ------------------------------ 动态专家数据集（从 AIRL 复制） ------------------------------
+# HER样本数据结构
+class HERSample:
+    def __init__(self, state, action):
+        self.state = state
+        self.action = action
+
+def collate_her_samples(batch):
+    """合并HER样本列表，返回 (states, actions) 的批处理字典"""
+    states = [item.state for item in batch]
+    actions = np.stack([item.action for item in batch])
+    # 构造状态字典
+    batched = {}
+    keys = states[0].keys()
+    for k in keys:
+        if k == 't':
+            batched[k] = torch.tensor([s[k] for s in states], dtype=torch.long)
+        elif isinstance(states[0][k], np.ndarray):
+            arr = np.stack([s[k] for s in states])
+            if k == 'all_mask':
+                batched[k] = torch.from_numpy(arr).bool()
+            else:
+                batched[k] = torch.from_numpy(arr).float()
+        else:
+            batched[k] = torch.tensor([s[k] for s in states])
+    return batched, torch.from_numpy(actions).float()
+
+# ------------------------------ 动态专家数据集 ------------------------------
 class DynamicExpertDataset:
     def __init__(self, env, num_trajectories_per_iter, min_lights, max_lights,
                  hue_similarity_range=(1, 3)):
@@ -192,6 +220,42 @@ def collect_trajectories(env, policy, num_steps, device, deterministic=False):
 
     return buffer
 
+# ------------------------------ 从缓冲区提取完整轨迹 ------------------------------
+def extract_trajectories(buffer):
+    """将缓冲区中的transition按done分割成完整轨迹列表，每条轨迹是一个Transition列表"""
+    transitions = buffer.get_all()
+    trajectories = []
+    current_traj = []
+    for t in transitions:
+        current_traj.append(t)
+        if t.done:
+            trajectories.append(current_traj)
+            current_traj = []
+    if current_traj:
+        # 如果最后一条轨迹未完成，丢弃（因为无法获取最终分布）
+        pass
+    return trajectories
+
+# ------------------------------ 生成HER样本 ------------------------------
+def generate_her_samples(trajectories):
+    """
+    从完整轨迹列表生成HER样本。
+    对每条轨迹，用最终分布的next_hue/next_value替换每个transition的状态目标，生成 (new_state, action) 样本。
+    返回 HERSample 列表。
+    """
+    her_samples = []
+    for traj in trajectories:
+        # 最终分布
+        final_hue = traj[-1].next_hue
+        final_value = traj[-1].next_value
+        for t in traj:
+            # 深拷贝状态
+            new_state = copy.deepcopy(t.state)
+            new_state['target_hue'] = final_hue
+            new_state['target_value'] = final_value
+            her_samples.append(HERSample(new_state, t.action))
+    return her_samples
+
 # ------------------------------ GAE 优势计算 ------------------------------
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     advantages = []
@@ -262,7 +326,7 @@ def evaluate_policy(env, policy, device, num_episodes=5):
     value_dists = []
     episode_rewards = []
     for _ in range(num_episodes):
-        state = env.reset()
+        state = env.reset(mode=1,n=3)
         done = False
         ep_reward = 0.0
         while not done:
@@ -357,6 +421,14 @@ def finetune_ppo(args):
 
     optimizer = optim.Adam(trainable_params, lr=args.lr)
 
+    # 学习率调度器
+    if args.lr_scheduler == 'step':
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
+    elif args.lr_scheduler == 'cosine':
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iterations, eta_min=args.lr_min)
+    else:
+        scheduler = None
+
     # 如果需要 BC loss，创建专家数据集
     if args.use_bc_loss:
         expert_dataset = DynamicExpertDataset(
@@ -382,6 +454,13 @@ def finetune_ppo(args):
         print("  Collecting trajectories...")
         rollout_buffer = collect_trajectories(env, policy, args.policy_steps_per_iter, device)
 
+        # 如果启用HER，从收集的轨迹生成HER样本
+        her_samples = []
+        if args.use_her and args.her_in_bc:
+            trajectories = extract_trajectories(rollout_buffer)
+            her_samples = generate_her_samples(trajectories)
+            print(f"    Generated {len(her_samples)} HER samples")
+
         # PPO 更新多次
         policy_loss_total = 0.0
         transitions = rollout_buffer.get_all()
@@ -390,18 +469,39 @@ def finetune_ppo(args):
             batch = [transitions[i] for i in indices]
             batched = collate_policy_trajectory(batch)
 
-            # 如果需要 BC loss，从专家数据集中采样并计算 BC loss
+            # 计算BC loss：可能来自真实专家和/或HER
+            bc_loss_val = None
             if args.use_bc_loss:
-                bc_batch = expert_dataset.sample(args.batch_size)
-                bc_states, bc_actions, _, _ = bc_batch
-                for k in bc_states:
-                    if isinstance(bc_states[k], torch.Tensor):
-                        bc_states[k] = bc_states[k].to(device)
-                bc_actions = bc_actions.to(device)
-                _, _, _, bc_log_prob, _ = policy(bc_states, action=bc_actions)
-                bc_loss_val = -bc_log_prob.mean()
-            else:
-                bc_loss_val = None
+                # 从真实专家采样
+                bc_expert_batch = expert_dataset.sample(args.batch_size)
+                bc_states_e, bc_actions_e, _, _ = bc_expert_batch
+                for k in bc_states_e:
+                    if isinstance(bc_states_e[k], torch.Tensor):
+                        bc_states_e[k] = bc_states_e[k].to(device)
+                bc_actions_e = bc_actions_e.to(device)
+                _, _, _, bc_log_prob_e, _ = policy(bc_states_e, action=bc_actions_e)
+                bc_loss_e = -bc_log_prob_e.mean()
+
+                # 如果启用HER，从HER样本采样并计算BC loss
+                if args.use_her and args.her_in_bc and len(her_samples) > 0:
+                    her_batch_size = int(args.batch_size * args.her_ratio)
+                    if her_batch_size > 0:
+                        her_indices = np.random.choice(len(her_samples), her_batch_size, replace=False)
+                        her_batch = [her_samples[i] for i in her_indices]
+                        her_states, her_actions = collate_her_samples(her_batch)
+                        for k in her_states:
+                            if isinstance(her_states[k], torch.Tensor):
+                                her_states[k] = her_states[k].to(device)
+                        her_actions = her_actions.to(device)
+                        _, _, _, bc_log_prob_h, _ = policy(her_states, action=her_actions)
+                        bc_loss_h = -bc_log_prob_h.mean()
+                        # 合并两个BC loss：加权平均（这里简单平均，但注意her_batch_size可能与args.batch_size不同）
+                        # 更好的方式是分别计算后按比例加权
+                        bc_loss_val = (bc_loss_e + bc_loss_h) / 2
+                    else:
+                        bc_loss_val = bc_loss_e
+                else:
+                    bc_loss_val = bc_loss_e
 
             loss = ppo_update(policy, optimizer, batched,
                               args.clip_epsilon, args.value_coef, args.entropy_coef,
@@ -433,13 +533,19 @@ def finetune_ppo(args):
             torch.save(policy.state_dict(), args.best_save_path)
             print(f"  New best model saved to {args.best_save_path}")
 
+        # 学习率调度器步进
+        if scheduler is not None:
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"  Current LR: {current_lr:.6f}")
+
     print("PPO finetuning finished.")
     with open(log_file, 'a') as f:
         f.write(f"Training finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
 # ------------------------------ 主程序入口 ------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PPO Finetuning with Fixed Reward")
+    parser = argparse.ArgumentParser(description="PPO Finetuning with Fixed Reward and HER")
     # 环境参数（更复杂场景）
     parser.add_argument('--min_lights', type=int, default=8, help='Minimum number of lights')
     parser.add_argument('--max_lights', type=int, default=8, help='Maximum number of lights')
@@ -454,8 +560,8 @@ if __name__ == "__main__":
     parser.add_argument('--pretrained_path', type=str, default='airl_latest.pth', help='Path to trained AIRL model')
 
     # 训练参数
-    parser.add_argument('--iterations', type=int, default=200)
-    parser.add_argument('--policy_steps_per_iter', type=int, default=1000, help='Steps collected per iteration')
+    parser.add_argument('--iterations', type=int, default=500)
+    parser.add_argument('--policy_steps_per_iter', type=int, default=1500, help='Steps collected per iteration')
     parser.add_argument('--policy_updates', type=int, default=10, help='Number of PPO updates per iteration')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate for actor/critic')
@@ -470,6 +576,18 @@ if __name__ == "__main__":
     parser.add_argument('--use_bc_loss', action='store_true', help='Whether to add BC loss during policy update')
     parser.add_argument('--bc_coef', type=float, default=0.1, help='Coefficient for BC loss')
     parser.add_argument('--expert_trajs_per_iter', type=int, default=20, help='Expert trajectories per iteration for BC (if used)')
+
+    # HER 选项
+    parser.add_argument('--use_her', action='store_true', help='Enable Hindsight Experience Replay')
+    parser.add_argument('--her_in_bc', action='store_true', help='Use HER samples for BC loss')
+    parser.add_argument('--her_ratio', type=float, default=0.2, help='Proportion of HER samples in BC batch (if used)')
+
+    # 学习率调度器
+    parser.add_argument('--lr_scheduler', type=str, default='step', choices=['none', 'step', 'cosine'],
+                        help='Learning rate scheduler type')
+    parser.add_argument('--lr_step_size', type=int, default=50, help='StepLR step size')
+    parser.add_argument('--lr_gamma', type=float, default=0.5, help='StepLR gamma')
+    parser.add_argument('--lr_min', type=float, default=1e-5, help='Minimum LR for cosine annealing')
 
     # 保存与日志
     parser.add_argument('--best_save_path', type=str, default='ppo_best.pth')

@@ -109,7 +109,7 @@ class LightingEnv:
         )
         return result['hue_histogram'], result['value_histogram']
 
-    def _generate_target_distribution(self,mode=None):
+    def _generate_target_distribution(self,mode=None,n=None):
         """
         随机选择目标生成方式：
         - 方式0：随机稀疏峰（峰值数从 1 ~ max_n_peaks 随机）
@@ -118,10 +118,16 @@ class LightingEnv:
         if mode is None:
             mode = np.random.choice([0, 1])  # 0: 稀疏峰, 1: 专家式
         if mode == 0:
-            n_peaks = np.random.randint(1, self.max_n_peaks + 1)
+            if n is not None:
+                n_peaks = n
+            else:
+                n_peaks = np.random.randint(1, self.max_n_peaks + 1)
             return self._gen_target_random_sparse(n_peaks)
         else:
-            hue_similarity = np.random.randint(1, self.max_hue_similarity + 1)
+            if n is not None:
+                hue_similarity = n
+            else:
+                hue_similarity = np.random.randint(1, self.max_hue_similarity + 1)
             # 注意：这里需要使用 self.N，因为 reset 中已设置灯光数量
             return self._gen_target_expert(self.N, hue_similarity)
 
@@ -164,7 +170,7 @@ class LightingEnv:
         }
         return state
 
-    def reset(self, N=None, mode=None):
+    def reset(self, N=None, mode=None, n=None):
         """重置环境（随机生成目标分布），返回初始状态"""
         if N is None:
             self.N = np.random.randint(self.min_lights, self.max_lights + 1)
@@ -195,7 +201,7 @@ class LightingEnv:
         self.current_idx = 0
 
         # 生成目标分布（随机选择方式）
-        self.target_hue_hist, self.target_value_hist = self._generate_target_distribution(mode)
+        self.target_hue_hist, self.target_value_hist = self._generate_target_distribution(mode,n)
 
         # 历史缓冲区（用0填充）
         self.history_positions = np.zeros((self.max_lights, 2), dtype=np.float32)
