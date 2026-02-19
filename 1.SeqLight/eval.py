@@ -30,7 +30,8 @@ def linear_l1_distance(p, q):
     q /= q.sum() + 1e-8
     return np.sum(np.abs(p - q)) / len(p)
 
-# ------------------------------ 灯光可视化函数（从您提供的代码复制） ------------------------------
+
+# ------------------------------ 灯光可视化函数 ------------------------------
 def visualize_individual_and_mixed_lights(
     positions: np.ndarray,
     hues: np.ndarray,          # 0~360
@@ -173,19 +174,17 @@ def visualize_individual_and_mixed_lights(
     plt.tight_layout()
     plt.show()
 
-# ------------------------------ 目标分布可视化辅助函数 ------------------------------
+
 def visualize_target_as_color_block(target_hue, target_value, figsize=(3,3)):
     """
     将目标分布（直方图）简化为一个色块显示。
     使用峰值色调和峰值亮度合成纯色。
     """
     peak_hue_bin = np.argmax(target_hue)
-    peak_hue = peak_hue_bin  # bin index 对应色调度数（0~359）
+    peak_hue = peak_hue_bin
     peak_value_bin = np.argmax(target_value)
-    # value 直方图的 bin 中心：0~1 分成100份，每个bin宽度0.01，中心为 (bin+0.5)/100
     peak_value = (peak_value_bin + 0.5) / 100.0
 
-    # HSV 转 RGB
     hsv = np.array([[[peak_hue/360.0, 1.0, peak_value]]], dtype=np.float32)
     rgb = hsv_to_rgb(hsv)[0,0]
 
@@ -195,23 +194,72 @@ def visualize_target_as_color_block(target_hue, target_value, figsize=(3,3)):
     ax.axis('off')
     plt.show()
 
-# ------------------------------ 评估主函数 ------------------------------
-def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0, plot=False, mode = None):
+
+# ------------------------------ 新增：搜索最优缩放因子 ------------------------------
+def find_best_scale(final_hues, final_values, target_hue, target_value, env,
+                    scale_min=0.5, scale_max=2.0, num_steps=100, criterion='l1'):
+    """
+    在 [scale_min, scale_max] 范围内线性搜索最优缩放因子。
+    criterion: 'l1' 最小化 value L1 距离，'mean' 最小化均值差异。
+    返回 (best_scale, best_value)
+    """
+    best_scale = 1.0
+    best_value = float('inf')
+    scales = np.linspace(scale_min, scale_max, num_steps)
+
+    # 预先计算目标均值（如果 criterion 为 mean）
+    if criterion == 'mean':
+        bin_centers = np.arange(100) * 0.01 + 0.005  # 每个 bin 的中心值
+        target_mean = np.sum(target_value * bin_centers)
+
+    for s in scales:
+        scaled_values = np.clip(final_values * s, 0, 1)
+        result = compute_mixed_lighting(
+            positions=env.positions_raw,
+            hues=final_hues,
+            values=scaled_values,
+            grid_size=(env.grid_h, env.grid_w),
+            decay_model=env.decay_model,
+            sigma=env.sigma,
+            value_power=env.value_power,
+            eps=env.eps
+        )
+        if criterion == 'l1':
+            scaled_value_hist = result['value_histogram']
+            dist = linear_l1_distance(scaled_value_hist, target_value)
+        elif criterion == 'mean':
+            scaled_mean = np.sum(result['value_histogram'] * bin_centers)
+            dist = abs(scaled_mean - target_mean)
+        else:
+            raise ValueError(f"Unknown criterion: {criterion}")
+
+        if dist < best_value:
+            best_value = dist
+            best_scale = s
+
+    return best_scale, best_value
+
+
+def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0,
+             plot=False, mode=None,
+             scale_values=False, scale_range=(0.5, 2.0), scale_criterion='l1'):
     """
     在环境中运行策略，评估目标分布与最终分布的差异。
-    返回每个episode的hue距离、value距离列表。
+    如果 scale_values 为 True，则对每个 episode 的最终灯光 values 进行全局缩放，
+    寻找最优缩放因子使 value 差异最小（根据 scale_criterion），并输出缩放后的指标。
+    绘图时始终使用缩放后的结果（如果启用缩放）。
     """
     policy.eval()
-    hue_dists = []
-    value_dists = []
+    hue_dists_raw = []
+    value_dists_raw = []
+    hue_dists_scaled = [] if scale_values else None
+    value_dists_scaled = [] if scale_values else None
+    best_scales = [] if scale_values else None
 
     for ep in range(num_episodes):
-        # 重置环境（随机目标分布）
-        # state = env.reset(mode=mode,value_bias=10)
         state = env.reset(mode=mode)
         done = False
         while not done:
-            # 构建批处理字典（增加batch维度）
             state_tensor = {}
             for k, v in state.items():
                 if isinstance(v, np.ndarray):
@@ -226,33 +274,85 @@ def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0, plot=
             next_state, _, done, info = env.step(action)
             state = next_state
 
-        # episode结束，info中包含了最后的分布信息
-        final_hue = info['hue_hist_after']
-        final_value = info['value_hist_after']
+        # 获取原始最终分布和灯光参数
+        final_hue_raw = info['hue_hist_after']
+        final_value_raw = info['value_hist_after']
         target_hue = info['target_hue_hist']
         target_value = info['target_value_hist']
 
-        hue_dist = circular_l1_distance(final_hue, target_hue)
-        value_dist = linear_l1_distance(final_value, target_value)
+        hue_dist_raw = circular_l1_distance(final_hue_raw, target_hue)
+        value_dist_raw = linear_l1_distance(final_value_raw, target_value)
 
-        hue_dists.append(hue_dist)
-        value_dists.append(value_dist)
+        hue_dists_raw.append(hue_dist_raw)
+        value_dists_raw.append(value_dist_raw)
 
-        print(f"Episode {ep+1}: Hue L1 = {hue_dist:.4f}, Value L1 = {value_dist:.4f}")
+        msg = f"Episode {ep+1}: Hue L1 = {hue_dist_raw:.4f}, Value L1 = {value_dist_raw:.4f}"
+
+        # 缩放处理
+        if scale_values:
+            # 搜索最优缩放因子（基于原始值）
+            best_scale, _ = find_best_scale(
+                env.hues.copy(), env.values.copy(),
+                target_hue, target_value, env,
+                scale_min=scale_range[0], scale_max=scale_range[1],
+                criterion=scale_criterion
+            )
+            best_scales.append(best_scale)
+
+            # 应用缩放并重新计算分布
+            scaled_values = np.clip(env.values.copy() * best_scale, 0, 1)
+            scaled_result = compute_mixed_lighting(
+                positions=env.positions_raw,
+                hues=env.hues,
+                values=scaled_values,
+                grid_size=(env.grid_h, env.grid_w),
+                decay_model=env.decay_model,
+                sigma=env.sigma,
+                value_power=env.value_power,
+                eps=env.eps
+            )
+            final_hue_scaled = scaled_result['hue_histogram']  # 理论上与 final_hue_raw 相同
+            final_value_scaled = scaled_result['value_histogram']
+
+            hue_dist_scaled = circular_l1_distance(final_hue_scaled, target_hue)
+            value_dist_scaled = linear_l1_distance(final_value_scaled, target_value)
+
+            hue_dists_scaled.append(hue_dist_scaled)
+            value_dists_scaled.append(value_dist_scaled)
+
+            msg += f", Best scale = {best_scale:.3f}, Scaled Value L1 = {value_dist_scaled:.4f}"
+
+            # 后续绘图使用缩放后的数据和分布
+            plot_hue = final_hue_scaled
+            plot_value = final_value_scaled
+            plot_values = scaled_values
+        else:
+            # 未缩放，使用原始数据
+            plot_hue = final_hue_raw
+            plot_value = final_value_raw
+            plot_values = env.values
+
+        print(msg)
 
         if plot:
-            # 绘制直方图对比
+            # 绘制直方图对比（使用缩放后的值或原始值）
             fig, axes = plt.subplots(1, 2, figsize=(12, 4))
             axes[0].bar(np.arange(360), target_hue, width=1, alpha=0.7, label='Target')
-            axes[0].bar(np.arange(360), final_hue, width=1, alpha=0.7, label='Final')
-            axes[0].set_title(f'Hue Distribution (L1={hue_dist:.4f})')
+            axes[0].bar(np.arange(360), plot_hue, width=1, alpha=0.7, label='Final')
+            title_hue = f'Hue Distribution (L1={hue_dist_raw:.4f})'
+            if scale_values:
+                title_hue += f' [Scaled L1={hue_dist_scaled:.4f}]'
+            axes[0].set_title(title_hue)
             axes[0].set_xlabel('Hue bin')
             axes[0].set_ylabel('Probability')
             axes[0].legend()
 
             axes[1].bar(np.arange(100), target_value, width=1, alpha=0.7, label='Target')
-            axes[1].bar(np.arange(100), final_value, width=1, alpha=0.7, label='Final')
-            axes[1].set_title(f'Value Distribution (L1={value_dist:.4f})')
+            axes[1].bar(np.arange(100), plot_value, width=1, alpha=0.7, label='Final')
+            title_val = f'Value Distribution (L1={value_dist_raw:.4f})'
+            if scale_values:
+                title_val += f' [Scaled L1={value_dist_scaled:.4f}]'
+            axes[1].set_title(title_val)
             axes[1].set_xlabel('Value bin')
             axes[1].set_ylabel('Probability')
             axes[1].legend()
@@ -273,28 +373,32 @@ def evaluate(env, policy, num_episodes, device, deterministic=True, t=1.0, plot=
                     sigma=env.sigma,
                     ncols=3,
                     show_mixed_hue=True,
-                    title_prefix=f"Episode {ep + 1} Ground Truth - "
+                    title_prefix=f"Episode {ep+1} Ground Truth - "
                 )
 
-            # 显示策略生成的灯光效果
+            # 显示策略生成的灯光效果（使用缩放后的 values 或原始 values）
             visualize_individual_and_mixed_lights(
                 positions=env.positions_raw,
                 hues=env.hues,
-                values=env.values,
+                values=plot_values,  # 关键：使用缩放后的值
                 grid_size=(env.grid_h, env.grid_w),
                 decay_model=env.decay_model,
                 sigma=env.sigma,
                 ncols=3,
                 show_mixed_hue=True,
-                title_prefix=f"Episode {ep + 1} Policy - "
+                title_prefix=f"Episode {ep+1} Policy{' (Scaled)' if scale_values else ''} - "
             )
 
-
-
-    avg_hue = np.mean(hue_dists)
-    avg_value = np.mean(value_dists)
-    print(f"\nAverage over {num_episodes} episodes: Hue L1 = {avg_hue:.4f}, Value L1 = {avg_value:.4f}")
-    return hue_dists, value_dists
+    # 统计输出
+    avg_hue_raw = np.mean(hue_dists_raw)
+    avg_value_raw = np.mean(value_dists_raw)
+    print(f"\nAverage over {num_episodes} episodes: Hue L1 = {avg_hue_raw:.4f}, Value L1 = {avg_value_raw:.4f}")
+    if scale_values:
+        avg_hue_scaled = np.mean(hue_dists_scaled)
+        avg_value_scaled = np.mean(value_dists_scaled)
+        avg_scale = np.mean(best_scales)
+        print(f"After scaling: Average Hue L1 = {avg_hue_scaled:.4f}, Average Value L1 = {avg_value_scaled:.4f}, Average scale = {avg_scale:.3f}")
+    return hue_dists_raw, value_dists_raw
 
 # ------------------------------ 主程序 ------------------------------
 def main():
@@ -310,17 +414,23 @@ def main():
     parser.add_argument('--d_model', type=int, default=64)
     parser.add_argument('--nhead', type=int, default=4)
     parser.add_argument('--num_layers', type=int, default=3)
-    parser.add_argument('--model_path', type=str, default="./airl_latest.pth", help='Path to trained model weights')
+    parser.add_argument('--model_path', type=str, default="./ppo_latest.pth", help='Path to trained model weights')
 
     # 评估参数
     parser.add_argument('--num_episodes', type=int, default=5, help='Number of episodes to evaluate')
     parser.add_argument('--deterministic', action='store_true', default=True, help='Use deterministic actions (mean)')
-    parser.add_argument('--t', type=float, default=0.1, help='Temperature')
-    parser.add_argument('--mode', type=int, default=1)
-
+    parser.add_argument('--t', type=float, default=1, help='Temperature')
+    parser.add_argument('--mode', type=int, default=None)
     parser.add_argument('--plot', action='store_true', default=True, help='Plot distribution comparisons for each episode')
-    parser.add_argument('--seed', type=int, default=420, help='Random seed for reproducibility')
+    parser.add_argument('--seed', type=int, default=1, help='Random seed for reproducibility')
     parser.add_argument('--no_cuda', action='store_true', default=False, help='Disable CUDA')
+
+    # 值缩放选项
+    parser.add_argument('--scale_values', action='store_true', default=True, help='Enable global scaling of final values')
+    parser.add_argument('--scale_min', type=float, default=0.01, help='Minimum scaling factor to search')
+    parser.add_argument('--scale_max', type=float, default=10.0, help='Maximum scaling factor to search')
+    parser.add_argument('--scale_criterion', type=str, default='mean', choices=['l1', 'mean'],
+                        help='Criterion for optimal scaling: l1 (minimize L1 distance) or mean (match mean)')
 
     args = parser.parse_args()
 
@@ -349,7 +459,15 @@ def main():
     print(f"Model loaded from {args.model_path}")
 
     # 评估
-    evaluate(env, policy, args.num_episodes, device, deterministic=args.deterministic, plot=args.plot, t=args.t, mode=args.mode)
+    evaluate(env, policy, args.num_episodes, device,
+             deterministic=args.deterministic,
+             plot=args.plot,
+             t=args.t,
+             mode=args.mode,
+             scale_values=args.scale_values,
+             scale_range=(args.scale_min, args.scale_max),
+             scale_criterion=args.scale_criterion)
+
 
 if __name__ == "__main__":
     main()
