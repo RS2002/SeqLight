@@ -1,4 +1,4 @@
-# General Light Decomposition RL
+# Light Decomposition RL
 
 ## How to Run
 
@@ -14,10 +14,10 @@ python bc.py --simple_layout
 python airl.py --simple_layout --use_bc_loss --use_her --her_in_expert --her_in_bc --pretrained_path <trained model path from Phase 1>
 ```
 
-### 3. PPO Fine-tuning Phase
+### 3. RL Fine-tuning Phase
 
 ```shell
-python ppo.py --simple_layout --use_bc_loss --use_her --her_in_bc --pretrained_path <trained model path from Phase 2>
+python ppo.py/grpo.py --simple_layout --use_bc_loss --use_her --her_in_bc --pretrained_path <trained model path from Phase 2>
 ```
 
 ### 4. Evaluate
