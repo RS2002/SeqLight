@@ -49,7 +49,7 @@ class ML_Dataset(Dataset):
         light = data['light']
 
         h = [light[int(i)][60][0] for i in sample]
-        v = [light[int(i)][0][1] for i in sample]
+        v = [light[int(i)][0][2] for i in sample]
         h = np.array(h)
         v = np.array(v)
 
@@ -76,8 +76,8 @@ class ML_Dataset(Dataset):
             v = v[start_index:start_index + self.sample_len]
         elif music_len < self.sample_len:
             music = np.concatenate([music, np.zeros([self.sample_len - music_len, music.shape[1]]) + pad], axis=0)
-            h = np.concatenate([h, np.zeros([self.sample_len - music_len,h.shape[1]]) + pad], axis=0)
-            v = np.concatenate([v, np.zeros([self.sample_len - music_len,v.shape[1]]) + pad], axis=0)
+            h = np.concatenate([h, np.zeros([self.sample_len - music_len, h.shape[1]]) + pad], axis=0)
+            v = np.concatenate([v, np.zeros([self.sample_len - music_len, v.shape[1]]) + pad], axis=0)
 
         music = music[::(self.gap + 1)]
         h = h[::(self.gap + 1)]
@@ -169,8 +169,12 @@ def load_pretrain(root_path, train_prop=0.9, max_len=600, gap=0):
 
 if __name__ == "__main__":
     dataset = load_data("/mnt/disk/dian/m2l_data/output", train_prop=1.0, max_len=600, gap=0, shuffle=False, random_seed=42, fix_start=0)
+    _emit_count = 0
     for music, (h, v), f_name in dataset:
-        print(music.shape, h.shape, v.shape, f_name)
+        if f_name.endswith('.pkl'):
+            if _emit_count < 1:
+                _emit_count += 1
+                continue  # 跳过前10个
         try:
             import matplotlib.pyplot as plt
 
@@ -191,7 +195,7 @@ if __name__ == "__main__":
             axes[1].set_ylabel("prob")
             axes[1].set_ylim(0, max(1e-6, float(np.max(v0)) * 1.1))
 
-            out_path = f"cache/first_frame_dist_{os.path.splitext(f_name)[0]}.png"
+            out_path = f"cache/first_frame_dist_{os.path.splitext(f_name)[0]}-{n_f}.png"
             fig.savefig(out_path, dpi=150)
             plt.close(fig)
             print("Saved first-frame distribution plot to:", out_path)
