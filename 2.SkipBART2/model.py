@@ -8,14 +8,14 @@ from peft import get_peft_model, LoraConfig
 
 
 class MLP(nn.Module):
-    def __init__(self, layer_sizes=[64,64,64,1], arl=False, dropout=0.0):
+    def __init__(self, layer_sizes=[64, 64, 64, 1], arl=False, dropout=0.0):
         super().__init__()
         self.arl = arl
         self.attention = nn.Sequential(
-            nn.Linear(layer_sizes[0],layer_sizes[0]),
+            nn.Linear(layer_sizes[0], layer_sizes[0]),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(layer_sizes[0],layer_sizes[0])
+            nn.Linear(layer_sizes[0], layer_sizes[0])
         )
 
         self.layer_sizes = layer_sizes
@@ -37,13 +37,13 @@ class MLP(nn.Module):
 
 
 class BART(nn.Module):
-    def __init__(self,bartconfig, class_num = 100):
+    def __init__(self, bartconfig, class_num=100):
         super().__init__()
         d_model = bartconfig.d_model
-        self.decoder_emb = nn.Embedding(class_num,d_model)
+        self.decoder_emb = nn.Embedding(class_num, d_model)
         self.bart = BartModel(bartconfig)
 
-    def forward(self, x_encoder, x_decoder, attn_mask_encoder = None, attn_mask_decoder = None):
+    def forward(self, x_encoder, x_decoder, attn_mask_encoder=None, attn_mask_decoder=None):
         emb_encoder = x_encoder
         emb_decoder = self.decoder_emb(x_decoder)
         y = self.bart(inputs_embeds=emb_encoder, decoder_inputs_embeds=emb_decoder,
@@ -52,7 +52,7 @@ class BART(nn.Module):
         y = y.last_hidden_state
         return y
 
-    def encode(self, x_encoder, attn_mask_encoder = None):
+    def encode(self, x_encoder, attn_mask_encoder=None):
         emb_encoder = x_encoder
         y = self.bart.encoder(inputs_embeds=emb_encoder, attention_mask=attn_mask_encoder, output_hidden_states=False)
         y = y.last_hidden_state
@@ -60,27 +60,30 @@ class BART(nn.Module):
 
 
 class ML_BART(nn.Module):
-    def __init__(self, bartconfig, class_num = [360,100], pretrain = False, music_dim=512):
+    def __init__(self, bartconfig, class_num=[180, 100], pretrain=False, music_dim=512):
         super().__init__()
         d_model = bartconfig.d_model
-
-        self.decoder_emb = nn.ModuleList([
-            MLP(int(class_num[0]), d_model // 4),
-            MLP(int(class_num[1]), d_model // 4)
+        # self.decoder_emb = nn.ModuleList([
+        #     MLP(int(class_num[0]), d_model // 4),
+        #     MLP(int(class_num[1]), d_model // 4)
+        # ])
+        self.decoder_emb2 = nn.ModuleList([
+            MLP([int(class_num[0]), d_model // 4]),
+            MLP([int(class_num[1]), d_model // 4])
         ])
-        self.decoder = MLP([music_dim,d_model//2])
+        self.decoder = MLP([music_dim, d_model // 2])
 
         self.bart = BartModel(bartconfig)
         self.pretrain = pretrain
 
-        self.encoder = MLP([music_dim,d_model])
+        self.encoder = MLP([music_dim, d_model])
         self.lora_config = LoraConfig(
             r=4,
             lora_alpha=16,
             lora_dropout=0.1
         )
 
-    def forward(self, x_encoder, x_decoder, attn_mask_encoder = None, attn_mask_decoder = None):
+    def forward(self, x_encoder, x_decoder, attn_mask_encoder=None, attn_mask_decoder=None):
         # emb_encoder = x_encoder
         emb_encoder = self.encoder(x_encoder)
 
@@ -88,7 +91,9 @@ class ML_BART(nn.Module):
             # emb_decoder = x_decoder
             emb_decoder = self.encoder(x_decoder)
         else:
-            emb_decoder = torch.concatenate([self.decoder_emb[0](x_decoder[..., 0]), self.decoder_emb[1](x_decoder[..., 1]), self.decoder(x_encoder)], dim=-1)
+            emb_decoder = torch.concatenate(
+                [self.decoder_emb2[0](x_decoder[0]), self.decoder_emb2[1](x_decoder[1]), self.decoder(x_encoder)],
+                dim=-1)
 
         y = self.bart(inputs_embeds=emb_encoder, decoder_inputs_embeds=emb_decoder,
                       attention_mask=attn_mask_encoder, decoder_attention_mask=attn_mask_decoder,
@@ -96,10 +101,10 @@ class ML_BART(nn.Module):
         y = y.last_hidden_state
         return y
 
-    def encode(self, x_encoder, attn_mask_encoder = None):
+    def encode(self, x_encoder, attn_mask_encoder=None):
         # emb_encoder = x_encoder
         emb_encoder = self.encoder(x_encoder)
-        
+
         y = self.bart.encoder(inputs_embeds=emb_encoder, attention_mask=attn_mask_encoder, output_hidden_states=False)
         y = y.last_hidden_state
         return y
@@ -113,10 +118,10 @@ class ML_BART(nn.Module):
 
 
 class ML_Classifier(nn.Module):
-    def __init__(self, hidden_dim = 512, class_num = [360,100]):
+    def __init__(self, hidden_dim=512, class_num=[360, 100]):
         super().__init__()
         self.classifier = nn.ModuleList([
-            MLP([hidden_dim,hidden_dim,class_num[0]]),
+            MLP([hidden_dim, hidden_dim, class_num[0]]),
             MLP([hidden_dim, hidden_dim, class_num[1]])
         ])
         self.softmax = nn.Softmax(dim=-1)
@@ -124,7 +129,7 @@ class ML_Classifier(nn.Module):
     def forward(self, x):
         h = self.classifier[0](x)
         v = self.classifier[1](x)
-        return self.softmax(h),self.softmax(v)
+        return self.softmax(h), self.softmax(v)
 
 
 class SelfAttention(nn.Module):
@@ -143,7 +148,7 @@ class Sequence_Classifier(nn.Module):
     def __init__(self, class_num=1, hs=512, da=512, r=8):
         super().__init__()
         self.attention = SelfAttention(hs, da, r)
-        self.classifier = MLP([hs * r, (hs * r + class_num)// 2, class_num])
+        self.classifier = MLP([hs * r, (hs * r + class_num) // 2, class_num])
 
     def forward(self, x):
         attn_mat = self.attention(x)
@@ -156,7 +161,7 @@ class Sequence_Classifier(nn.Module):
 class Token_Predictor(nn.Module):
     def __init__(self, hidden_dim=512, class_num=1):
         super().__init__()
-        self.classifier = MLP([hidden_dim, (hidden_dim+class_num)//2, class_num])
+        self.classifier = MLP([hidden_dim, (hidden_dim + class_num) // 2, class_num])
 
     def forward(self, x):
         x = self.classifier(x)

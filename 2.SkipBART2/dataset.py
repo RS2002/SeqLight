@@ -76,8 +76,8 @@ class ML_Dataset(Dataset):
             v = v[start_index:start_index + self.sample_len]
         elif music_len < self.sample_len:
             music = np.concatenate([music, np.zeros([self.sample_len - music_len, music.shape[1]]) + pad], axis=0)
-            h = np.concatenate([h, np.zeros([self.sample_len - music_len]) + pad], axis=0)
-            v = np.concatenate([v, np.zeros([self.sample_len - music_len]) + pad], axis=0)
+            h = np.concatenate([h, np.zeros([self.sample_len - music_len,h.shape[1]]) + pad], axis=0)
+            v = np.concatenate([v, np.zeros([self.sample_len - music_len,v.shape[1]]) + pad], axis=0)
 
         music = music[::(self.gap + 1)]
         h = h[::(self.gap + 1)]

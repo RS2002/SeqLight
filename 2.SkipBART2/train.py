@@ -21,7 +21,7 @@ def get_args():
     parser = argparse.ArgumentParser(description='')
 
     parser.add_argument("--music_dim", type=int, default=512)
-    parser.add_argument("--light_dim", type=int, nargs='+', default=[360, 100])
+    parser.add_argument("--light_dim", type=int, nargs='+', default=[180, 100])
     parser.add_argument('--gap', type=int, default=0)
 
     parser.add_argument('--layers', type=int, default=8)
@@ -37,7 +37,7 @@ def get_args():
     parser.add_argument('--converge_epoch', type=int, default=30)
     parser.add_argument('--min_epoch', type=int, default=50)
 
-    parser.add_argument('--data_path', type=str, default="./discard/test/data")
+    parser.add_argument('--data_path', type=str, default="./data")
     parser.add_argument('--train_prop', type=float, default=0.9)
 
     parser.add_argument('--model_path', type=str, default=None)
@@ -68,19 +68,21 @@ def iteration(data_loader, device, bart, model, optim, train=True, weight=[1.0, 
     pbar = tqdm.tqdm(data_loader, disable=False)
     for music, light, f_name in pbar:
         music = music.float().to(device)
-        light = light.numpy()
+        h_gt, v_gt = light
 
-        # 1. Tokenize Light
-        light[light[..., 0, :] < 0, :, 0] = 0
-        light[light[..., 1, :] < 0, :, 1] = 0
+        # 1. Process Light
+        h_gt[h_gt<0] = 0
+        v_gt[v_gt<0] = 0
+        h_gt = h_gt.float().to(device)
+        v_gt = v_gt.float().to(device)
 
-        light = torch.from_numpy(light)
-        light = torch.round(light)
-        light = light.long().to(device)
-
-        light_input = torch.zeros_like(light)
-        light_input[:, 1:, :] = light[:, :-1, :]
-        light_input[:, 0, :] = light[:, 0, :]
+        h_input = torch.zeros_like(h_gt)
+        h_input[:, 1:, :] = h_gt[:, :-1, :]
+        h_input[:, 0, :] = h_gt[:, 0, :]
+        v_input = torch.zeros_like(v_gt)
+        v_input[:, 1:, :] = v_gt[:, :-1, :]
+        v_input[:, 0, :] = v_gt[:, 0, :]
+        light_input = [h_input,v_input]
 
         # 2. Process Music Emb
         non_pad = (music != pad).to(device)
@@ -90,7 +92,6 @@ def iteration(data_loader, device, bart, model, optim, train=True, weight=[1.0, 
         std = torch.sqrt(torch.sum(((music - avg) ** 2) * non_pad, dim=1, keepdim=True) / (
                 torch.sum(non_pad, dim=1, keepdim=True) + 1e-8))
         rand_word = (rand_word + avg) * std
-        # rand_word = torch.clip(rand_word,0,1)
         music[~non_pad.bool()] = rand_word[~non_pad.bool()]
         attn_mask = non_pad[..., 0].float()
         attn_mask_light = torch.zeros_like(attn_mask)
@@ -100,7 +101,7 @@ def iteration(data_loader, device, bart, model, optim, train=True, weight=[1.0, 
         # 3. train
         h_hat, v_hat = model(bart(music, light_input, attn_mask, attn_mask_light))
         h_hat, v_hat = h_hat.reshape(batch_size * seq_len, -1), v_hat.reshape(batch_size * seq_len, -1)
-        h, v = light[..., 0].reshape(batch_size * seq_len, -1), light[..., 1].reshape(batch_size * seq_len, -1)
+        h, v = h_gt.reshape(batch_size * seq_len, -1), v_gt.reshape(batch_size * seq_len, -1)
         attn_mask = attn_mask.reshape(batch_size * seq_len)
         loss_h = torch.sum(F.kl_div(torch.log(h_hat + 1e-8), h, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
         loss_v = torch.sum(F.kl_div(torch.log(v_hat + 1e-8), v, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
