@@ -73,6 +73,8 @@ class ML_BART(nn.Module):
         ])
         self.decoder = MLP([music_dim, d_model // 2])
 
+        self.sos = nn.Parameter(torch.randn([1,1,d_model]),requires_grad=True)
+
         self.bart = BartModel(bartconfig)
         self.pretrain = pretrain
 
@@ -94,6 +96,8 @@ class ML_BART(nn.Module):
             emb_decoder = torch.concatenate(
                 [self.decoder_emb2[0](x_decoder[0]), self.decoder_emb2[1](x_decoder[1]), self.decoder(x_encoder)],
                 dim=-1)
+            sos = self.sos.repeat(x_encoder.shape[0],1,1)
+            emb_decoder = torch.concat([sos,emb_decoder[:,1:,:]],dim=1)
 
         y = self.bart(inputs_embeds=emb_encoder, decoder_inputs_embeds=emb_decoder,
                       attention_mask=attn_mask_encoder, decoder_attention_mask=attn_mask_decoder,

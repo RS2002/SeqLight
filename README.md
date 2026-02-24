@@ -1,6 +1,6 @@
 # SeqLight
 
-**Article:** "Stage Light is Seq²: Multi-Light Control via Reinforcement Learning" (in preparation)
+**Article:** "Stage Light is Seq²: Multi-Light Control via Imitation Learning" (in preparation)
 
 
 

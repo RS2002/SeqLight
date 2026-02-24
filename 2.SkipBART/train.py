@@ -40,7 +40,7 @@ def get_args():
     parser.add_argument('--data_path', type=str, default="./data")
     parser.add_argument('--train_prop', type=float, default=0.9)
 
-    parser.add_argument('--model_path', type=str, default=None)
+    parser.add_argument('--model_path', type=str, default="./model/bart_finetune.pth")
 
     parser.add_argument("--shuffle", action="store_true", default=False)
     parser.add_argument('--random_seed', type=int, default=42)
@@ -78,10 +78,10 @@ def iteration(data_loader, device, bart, model, optim, train=True, weight=[1.0, 
 
         h_input = torch.zeros_like(h_gt)
         h_input[:, 1:, :] = h_gt[:, :-1, :]
-        h_input[:, 0, :] = h_gt[:, 0, :]
+        # h_input[:, 0, :] = h_gt[:, 0, :]
         v_input = torch.zeros_like(v_gt)
         v_input[:, 1:, :] = v_gt[:, :-1, :]
-        v_input[:, 0, :] = v_gt[:, 0, :]
+        # v_input[:, 0, :] = v_gt[:, 0, :]
         light_input = [h_input,v_input]
 
         # 2. Process Music Emb
@@ -105,7 +105,7 @@ def iteration(data_loader, device, bart, model, optim, train=True, weight=[1.0, 
         attn_mask = attn_mask.reshape(batch_size * seq_len)
         loss_h = torch.sum(F.kl_div(torch.log(h_hat + 1e-8), h, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
         loss_v = torch.sum(F.kl_div(torch.log(v_hat + 1e-8), v, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
-        loss = loss_h * weight[0] + loss_v * weight[1]
+        loss = loss_h * weight[0] * 2 + loss_v * weight[1] * 2
         loss_list.append((loss_h + loss_v).item())
         h_loss_list.append(loss_h.item())
         v_loss_list.append(loss_v.item())
@@ -173,7 +173,7 @@ def main():
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=5)
     test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=True, num_workers=5)
 
-    weight = [1.0, 1.0]
+    weight = [0.4, 0.6]
     while True:
         j += 1
         loss_h, loss_v, loss = iteration(train_loader, device, bart, model, optim, train=True, weight=weight)
