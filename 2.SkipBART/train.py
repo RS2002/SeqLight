@@ -40,7 +40,7 @@ def get_args():
     parser.add_argument('--data_path', type=str, default="./data")
     parser.add_argument('--train_prop', type=float, default=0.9)
 
-    parser.add_argument('--model_path', type=str, default="./model/bart_finetune.pth")
+    parser.add_argument('--model_path', type=str, default="./pretrain/bart_finetune.pth")
 
     parser.add_argument("--shuffle", action="store_true", default=False)
     parser.add_argument('--random_seed', type=int, default=42)
@@ -103,8 +103,10 @@ def iteration(data_loader, device, bart, model, optim, train=True, weight=[1.0, 
         h_hat, v_hat = h_hat.reshape(batch_size * seq_len, -1), v_hat.reshape(batch_size * seq_len, -1)
         h, v = h_gt.reshape(batch_size * seq_len, -1), v_gt.reshape(batch_size * seq_len, -1)
         attn_mask = attn_mask.reshape(batch_size * seq_len)
-        loss_h = torch.sum(F.kl_div(torch.log(h_hat + 1e-8), h, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
-        loss_v = torch.sum(F.kl_div(torch.log(v_hat + 1e-8), v, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
+        # loss_h = torch.sum(F.kl_div(torch.log(h_hat + 1e-8), h, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
+        # loss_v = torch.sum(F.kl_div(torch.log(v_hat + 1e-8), v, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
+        loss_h = torch.sum(F.kl_div(torch.log(h + 1e-8), h_hat, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
+        loss_v = torch.sum(F.kl_div(torch.log(v + 1e-8), v_hat, reduction='batchmean') * attn_mask) / torch.sum(attn_mask)
         loss = loss_h * weight[0] * 2 + loss_v * weight[1] * 2
         loss_list.append((loss_h + loss_v).item())
         h_loss_list.append(loss_h.item())

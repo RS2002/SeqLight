@@ -23,8 +23,8 @@ def get_args():
     parser.add_argument("--light_dim", type=int, nargs='+', default=[180, 100])
     parser.add_argument('--gap', type=int, default=0)
 
-    parser.add_argument("--t", type=float, nargs='+', default=[0.01, 1.0])
-    parser.add_argument("--p", type=float, nargs='+', default=[0.30, 0.9])
+    parser.add_argument("--t", type=float, nargs='+', default=[0.1, 1.0])
+    parser.add_argument("--p", type=float, nargs='+', default=[0.5, 0.9])
     parser.add_argument("--h_range", type=int, default=50)
     parser.add_argument("--v_range", type=int, default=30)
 
@@ -60,6 +60,7 @@ def get_args():
 
     args = parser.parse_args()
     return args
+
 
 def nucleus(probs, p):
     probs /= (sum(probs) + 1e-5)
@@ -138,12 +139,8 @@ def iteration(data_loader, device, bart, model, env, policy, light_num, t, p, h_
     output_value = []
 
     # pbar = tqdm.tqdm(data_loader, disable=False)
-    for music, gt, f_name in data_loader:
+    for music, _, f_name in data_loader:
         music = music.float().to(device)
-        # hue_gt, value_gt = gt
-        # hue_gt, value_gt = hue_gt.float().to(device), value_gt.float().to(device)
-        # light = [torch.softmax(torch.randn([music.shape[0], music.shape[1], 180]).to(device),dim=-1), torch.softmax(torch.randn([music.shape[0], music.shape[1], 100]).to(device),dim=-1)]
-        # light[0][:,0,:], light[1][:,0,:] = hue_gt[:,0,:], value_gt[:,0,:]
         light = [torch.zeros([music.shape[0], music.shape[1], 180]).to(device),
                  torch.zeros([music.shape[0], music.shape[1], 100]).to(device)]
 
@@ -260,10 +257,12 @@ def iteration(data_loader, device, bart, model, env, policy, light_num, t, p, h_
                 result_light[0][w, i] = torch.tensor(light_hues)
                 result_light[1][w, i] = torch.tensor(light_values)
 
+
         output_hue.append(result[0].cpu().detach())
         output_value.append(result[1].cpu().detach())
         output_light_hue.append(result_light[0].detach())
         output_light_value.append(result_light[1].detach())
+
 
     return torch.cat(output_hue, dim=0), torch.cat(output_value, dim=0), torch.cat(output_light_hue, dim=0), torch.cat(
         output_light_value, dim=0)
@@ -329,7 +328,6 @@ def main():
     value_gt = []
     f_names = []
     for i in range(len(test_data)):
-    # for i in range(1):
         music, hv, f_name = test_data[i]
         hue, value = hv
         hue_gt.append(hue)
@@ -354,7 +352,7 @@ def main():
         'f_names': f_names
     }
     info = f'h_range={args.h_range}, v_range={args.v_range}, t={args.t[0]}-{args.t[1]}, p={args.p[0]}-{args.p[1]}'
-    with open(os.path.join(folder_path, f'light_pred_{info}_filt.pkl'), 'wb') as f:
+    with open(os.path.join(folder_path, f'light_pred_{info}.pkl'), 'wb') as f:
         pickle.dump(res, f)
 
 
