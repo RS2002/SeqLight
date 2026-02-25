@@ -23,10 +23,10 @@ def get_args():
     parser.add_argument("--light_dim", type=int, nargs='+', default=[180, 100])
     parser.add_argument('--gap', type=int, default=0)
 
-    parser.add_argument("--t", type=float, nargs='+', default=[1.0, 1.0])
-    parser.add_argument("--p", type=float, nargs='+', default=[0.9, 0.9])
+    parser.add_argument("--t", type=float, nargs='+', default=[0.01, 1.0])
+    parser.add_argument("--p", type=float, nargs='+', default=[0.30, 0.9])
     parser.add_argument("--h_range", type=int, default=50)
-    parser.add_argument("--v_range", type=int, default=20)
+    parser.add_argument("--v_range", type=int, default=30)
 
     parser.add_argument('--layers', type=int, default=8)
     parser.add_argument('--max_len', type=int, default=1024)
