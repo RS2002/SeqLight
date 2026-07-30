@@ -12,8 +12,8 @@ class LightingEnv:
         sigma=0.18,
         value_power=1.0,
         eps=1e-8,
-        min_lights=8,
-        max_lights=8,
+        min_lights=6,
+        max_lights=6,
         target_gen_modes=[1],
         simple_layout=True,
         max_n_peaks=3,
@@ -63,6 +63,27 @@ class LightingEnv:
         random.seed(seed)
         torch.manual_seed(seed)
 
+    def get_state(self):
+        """返回当前状态字典，用于 GRPO 轨迹收集"""
+        current_position = self.positions_raw[self.light_indices[self.current_idx]]
+        current_hue, current_value = self._compute_current_mixed()
+        return self._build_state(current_position, current_hue, current_value)
+
+    def _get_simple_layout_positions(self, N):
+        """返回默认规则布局位置。
+        当 N == 6 时，使用两行三列的固定点光源布局；否则回退为环形均匀布局。"""
+        if N == 6:
+            xs = np.array([0.2, 0.5, 0.8], dtype=np.float32)
+            ys = np.array([0.35, 0.65], dtype=np.float32)
+            positions = np.array([[x, y] for y in ys for x in xs], dtype=np.float32)
+            return positions
+
+        angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
+        return np.array([
+            [0.5 + 0.5 * np.cos(angle), 0.5 + 0.5 * np.sin(angle)]
+            for angle in angles
+        ]).astype(np.float32)
+
     def _gen_target_random_sparse(self, n_peaks):
         """
         生成稀疏高斯峰目标分布，峰值数由 n_peaks 指定。
@@ -100,11 +121,7 @@ class LightingEnv:
 
         # 生成灯光位置（与 reset 中 simple_layout 逻辑一致）
         if self.simple_layout:
-            angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-            positions = np.array([
-                [0.5 + 0.5 * np.cos(angle), 0.5 + 0.5 * np.sin(angle)]
-                for angle in angles
-            ]).astype(np.float32)
+            positions = self._get_simple_layout_positions(N)
         else:
             positions = np.random.uniform(0, 1, size=(N, 2)).astype(np.float32)
 
@@ -183,20 +200,46 @@ class LightingEnv:
         }
         return state
 
-    def reset(self, N=None, mode=None, n=None, value_range=None, value_bias=None):
-        """重置环境，返回初始状态。mode=0 稀疏峰，mode=1 专家模式（保存 ground truth）"""
+    def _resample_histogram(self, hist, target_bins):
+        """
+        将直方图重新采样到目标 bin 数，并归一化。
+        hist: 原始直方图数组，长度为任意。
+        target_bins: 目标 bin 数量。
+        返回: 归一化后的 target_bins 长度数组。
+        """
+        src_len = len(hist)
+        if src_len == target_bins:
+            # 如果长度已匹配，仅归一化返回
+            return (hist.astype(np.float32) / (hist.sum() + 1e-8)).astype(np.float32)
+
+        # 原始 bin 中心位置（假设 bin 均匀分布在 [0,1] 区间）
+        src_centers = np.linspace(0, 1, src_len, endpoint=False) + 0.5 / src_len
+        # 目标 bin 中心位置
+        tgt_centers = np.linspace(0, 1, target_bins, endpoint=False) + 0.5 / target_bins
+
+        # 线性插值
+        new_hist = np.interp(tgt_centers, src_centers, hist.astype(np.float64))
+        new_hist = np.maximum(new_hist, 0)  # 去除可能的负值
+        new_hist /= new_hist.sum() + 1e-8
+        return new_hist.astype(np.float32)
+
+    def reset(self, N=None, mode=None, n=None, value_range=None, value_bias=None,
+              goal_hue=None, goal_value=None):
+        """重置环境，返回初始状态。
+        参数:
+            goal_hue: 可选，目标色调分布，可以是任意长度的数组，会自动插值到 360 bin。
+            goal_value: 可选，目标亮度分布，可以是任意长度的数组，会自动插值到 100 bin。
+            如果提供了 goal_hue 和 goal_value，则直接使用它们作为目标分布，忽略 mode 和 n。
+        """
+        # 确定灯光数量
         if N is None:
             self.N = np.random.randint(self.min_lights, self.max_lights + 1)
         else:
             self.N = N
 
-        # 生成灯光位置（保持不变）
+        # 生成灯光位置（默认 simple_layout 为 2x3 六点布局）
         if self.simple_layout:
-            angles = np.linspace(0, 2 * np.pi, self.N, endpoint=False)
-            self.positions_raw = np.array([
-                [0.5 + 0.5 * np.cos(angle), 0.5 + 0.5 * np.sin(angle)]
-                for angle in angles
-            ]).astype(np.float32)
+            self.positions_raw = self._get_simple_layout_positions(self.N)
             self.light_indices = np.arange(self.N)
         else:
             self.positions_raw = np.random.uniform(0, 1, size=(self.N, 2)).astype(np.float32)
@@ -213,41 +256,45 @@ class LightingEnv:
         self.values = np.zeros(self.N, dtype=np.float32)
         self.current_idx = 0
 
-        # 根据 mode 生成目标分布
-        if mode is None:
-            mode = np.random.choice([0, 1])  # 随机选择模式
-
-        if mode == 0:  # 随机稀疏峰
-            if n is not None:
-                n_peaks = n
-            else:
-                n_peaks = np.random.randint(1, self.max_n_peaks + 1)
-            self.target_hue_hist, self.target_value_hist = self._gen_target_random_sparse(n_peaks)
+        # 设置目标分布
+        if goal_hue is not None and goal_value is not None:
+            # 使用给定的目标分布，必要时进行插值
+            self.target_hue_hist = self._resample_histogram(goal_hue, 360)
+            self.target_value_hist = self._resample_histogram(goal_value, 100)
             self.ground_truth_hues = None
             self.ground_truth_values = None
-        else:  # 专家模式
-            if n is not None:
-                hue_similarity = n
-            else:
-                hue_similarity = np.random.randint(1, self.max_hue_similarity + 1)
-
-            # 生成最终灯光参数（保存为 ground truth）
-            self.ground_truth_hues, self.ground_truth_values = self._generate_final_hues_values(
-                self.N, hue_similarity, value_range=value_range, value_bias=value_bias
-            )
-            # 计算目标分布
-            final_result = compute_mixed_lighting(
-                positions=self.positions_raw,
-                hues=self.ground_truth_hues,
-                values=self.ground_truth_values,
-                grid_size=(self.grid_h, self.grid_w),
-                decay_model=self.decay_model,
-                sigma=self.sigma,
-                value_power=self.value_power,
-                eps=self.eps
-            )
-            self.target_hue_hist = final_result['hue_histogram']
-            self.target_value_hist = final_result['value_histogram']
+        else:
+            # 原有随机生成逻辑
+            if mode is None:
+                mode = np.random.choice([0, 1])
+            if mode == 0:  # 随机稀疏峰
+                if n is not None:
+                    n_peaks = n
+                else:
+                    n_peaks = np.random.randint(1, self.max_n_peaks + 1)
+                self.target_hue_hist, self.target_value_hist = self._gen_target_random_sparse(n_peaks)
+                self.ground_truth_hues = None
+                self.ground_truth_values = None
+            else:  # 专家模式
+                if n is not None:
+                    hue_similarity = n
+                else:
+                    hue_similarity = np.random.randint(1, self.max_hue_similarity + 1)
+                self.ground_truth_hues, self.ground_truth_values = self._generate_final_hues_values(
+                    self.N, hue_similarity, value_range=value_range, value_bias=value_bias
+                )
+                final_result = compute_mixed_lighting(
+                    positions=self.positions_raw,
+                    hues=self.ground_truth_hues,
+                    values=self.ground_truth_values,
+                    grid_size=(self.grid_h, self.grid_w),
+                    decay_model=self.decay_model,
+                    sigma=self.sigma,
+                    value_power=self.value_power,
+                    eps=self.eps
+                )
+                self.target_hue_hist = final_result['hue_histogram']
+                self.target_value_hist = final_result['value_histogram']
 
         # 历史缓冲区（保持不变）
         self.history_positions = np.zeros((self.max_lights, 2), dtype=np.float32)
@@ -407,11 +454,7 @@ class LightingEnv:
         # 生成位置
         if positions is None:
             if self.simple_layout:
-                angles = np.linspace(0, 2*np.pi, N, endpoint=False)
-                positions = np.array([
-                    [0.5 + 0.5 * np.cos(angle), 0.5 + 0.5 * np.sin(angle)]
-                    for angle in angles
-                ]).astype(np.float32)
+                positions = self._get_simple_layout_positions(N)
             else:
                 positions = np.random.uniform(0, 1, size=(N, 2)).astype(np.float32)
 
@@ -482,11 +525,7 @@ class LightingEnv:
 
         # 生成灯光位置
         if self.simple_layout:
-            angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-            positions = np.array([
-                [0.5 + 0.5 * np.cos(angle), 0.5 + 0.5 * np.sin(angle)]
-                for angle in angles
-            ]).astype(np.float32)
+            positions = self._get_simple_layout_positions(N)
             light_indices = np.arange(N)
         else:
             positions = np.random.uniform(0, 1, size=(N, 2)).astype(np.float32)
@@ -566,29 +605,11 @@ class LightingEnv:
 
 
 if __name__ == '__main__':
-    # 测试新功能
-    env = LightingEnv(simple_layout=True, max_n_peaks=4, max_hue_similarity=3, default_value_bias=1.0)
+    # 假设已有目标分布数组
+    target_hue = np.random.rand(150)
+    target_hue /= target_hue.sum()
+    target_value = np.random.rand(80)
+    target_value /= target_value.sum()
 
-    # 测试 reset 产生均匀亮度目标
-    print("=== reset (uniform brightness) ===")
-    state = env.reset(N=8)
-    print("target_value mean bin (approx):", np.sum(np.arange(100) * state['target_value']) / 100)
-
-    # 测试 reset 产生高亮度目标（使用 value_bias=0.5 偏向高值）
-    print("\n=== reset with low brightness bias (value_bias=0.5) ===")
-    state = env.reset(N=8, value_bias=0.5)
-    # print(state)
-    print("target_value mean bin (approx):", np.sum(np.arange(100) * state['target_value']) / 100)
-
-    # 测试 reset_expert 产生极低亮度目标（value_range=(0,0.3) 且 value_bias=2）
-    print("\n=== reset_expert with very low brightness (range=(0,0.3), bias=2) ===")
-    state = env.reset_expert(N=8, hue_similarity=3, value_range=(0, 0.3), value_bias=2.0)
-    # print(state)
-    print("target_value mean bin (approx):", np.sum(np.arange(100) * state['target_value']) / 100)
-
-    # 测试生成专家轨迹，使用 value_bias=10 使每个灯光偏暗
-    print("\n=== generate_expert_trajectory with bias=10 ===")
-    traj = env.generate_expert_trajectory(N=6, hue_similarity=2, value_bias=10.0)
-    for step, (s, a, next_hue, next_value) in enumerate(traj):
-        print(f"Step {step}: action {a}, next_value mean ~ {np.sum(np.arange(100)*next_value)/100:.4f}")
-    print("轨迹长度:", len(traj))
+    env = LightingEnv()
+    state = env.reset(goal_hue=target_hue, goal_value=target_value)
